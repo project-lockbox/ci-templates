@@ -1,0 +1,1961 @@
+# Lockbox reusable workflow for customer repositories (GitHub Actions), template version 2.
+# Build mode: resolve (pin every FROM to a digest) -> buildx build and push to a STAGING tag ->
+# Trivy by digest -> result.json -> signed vulnerability attestation -> promote by digest to the
+# release tag only if the scan passed -> sign and attest. (Scan-only mode was removed in v2.3.0:
+# the in-cluster scanner covers images CI did not build.)
+# Design: docs/design/ci-templates.md (T2.11) and docs/design/scan-trust.md. Lockbox never builds
+# or pushes: everything below runs in YOUR runner, with YOUR registry credentials.
+#
+# PAT-7 (v2.1.0): the scan gate ignores findings that have no fixed version. They stay in
+# trivy.json and result.json counts, and Lockbox still reports them. There is no new input.
+#
+# Pull-request mode (v2.2.0, T5.16; docs/design/validation-build.md section 7.1): on a
+# `pull_request` event the workflow runs resolve, build and push to the STAGING repository (tag
+# lockbox-mr-<number>-<run id>-<attempt>), scan and gate, and nothing else: no A1 attestation,
+# promote, provenance or signature (LOCKBOX_PUBLISH is false), no release tag. result.json says
+# "mode": "mr" with an "mr" object (number, head_repo, head_sha, base_ref). Trigger it from a
+# `pull_request` workflow, NEVER `pull_request_target` (that event would run with the base
+# repository's secrets and write token on the head's code); fork pull requests get a read-only
+# token, fail to push and are not evidence. The caller still grants the four permissions below
+# (id-token and attestations are unused in this mode).
+#
+# Lockbox triggers this workflow and reads the "lockbox-scan" artifact through its GitHub App.
+# Nothing is sent from the runner to Lockbox directly.
+#
+# Usage, in .github/workflows/lockbox.yml of the customer repository:
+#
+#   name: lockbox
+#   run-name: lockbox ${{ inputs.lockbox-run-id }}     # REQUIRED: Lockbox matches the run by this title
+#   on:
+#     workflow_dispatch:
+#       inputs:                                         # declare EVERY input Lockbox sends (GitHub rejects others)
+#         lockbox-run-id: { type: string, required: false }
+#         lockbox-reason: { type: string, required: false }
+#     push:
+#       branches: [main]                                # protected branch (trust check T2)
+#   permissions: {}
+#   jobs:
+#     build:
+#       permissions:                                    # a caller must grant exactly these
+#         contents: read
+#         packages: write
+#         id-token: write
+#         attestations: write
+#       uses: <org>/<repo>/.github/workflows/lockbox-build.yml@<full commit sha>   # by SHA, never a tag or branch
+#       with:
+#         image: ghcr.io/acme/payments-api              # release repository workloads pull
+#         staging-image: ghcr.io/acme/staging/payments-api  # workloads must NOT be able to pull this
+#         trivy-image: aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb
+#         # trivy-db-repository: registry.example.internal/mirror/trivy-db:2   # offline only, a literal
+#         lockbox-run-id: ${{ inputs.lockbox-run-id }}
+#         lockbox-reason: ${{ inputs.lockbox-reason }}
+#       secrets: inherit
+#
+# Inputs
+#   mode             default build. The only mode; scan-only was removed in v2.3.0 and the guard
+#                    step fails with a message that says so.
+#   image            build. Release repository (no tag). Written only after a passing scan.
+#   staging-image    build. Staging repository. Refused when empty or equal to image.
+#   trivy-image      required. Trivy image, pinned by digest (name:tag@sha256:...).
+#   severity         default HIGH,CRITICAL. Severities that fail the gate. Any secret also fails it.
+#                    Lockbox gates on the union with its own floor, so narrowing it never helps.
+#   signing          default keyless. keyless (Sigstore through GitHub OIDC), key (cosign key or KMS),
+#                    none (the image is reported as unverified and every scan result as untrusted).
+#   cosign-key       signing: key only. KMS URI, env://COSIGN_PRIVATE_KEY (default) or a key file.
+#   tlog-upload      signing: key only. false for offline customers (no Rekor upload).
+#   release-tag      default: the commit SHA.
+#   trivy-db-repository, trivy-java-db-repository   default empty (Trivy's defaults). Offline customers:
+#                    the Trivy vulnerability database and Java database mirrors, OCI references with an
+#                    explicit registry host (host[:port]/path[:tag][@sha256:...]). Write them as LITERALS in
+#                    the committed caller workflow, never ${{ vars.* }} or ${{ secrets.* }} (T2.17b). The scan
+#                    records them in result.json, and Lockbox trusts a scan that used a mirror only when its
+#                    trusted templates policy lists it for this template SHA (trivy_db_repositories,
+#                    trivy_java_db_repositories). TRIVY_* variables are ignored by the scan.
+#   pull-hosts       build. Comma-separated registry hosts that may receive PULL_USERNAME/PULL_PASSWORD
+#                    for base image pulls (and are not the image or staging-image hosts). Default none:
+#                    base pulls are anonymous.
+#   lockbox-run-id, lockbox-reason   set by Lockbox when it
+#                    dispatches the run (the ONLY inputs it sends), empty otherwise.
+#   context, containerfile, platform   build settings (single platform, default linux/amd64).
+#   platforms        v2.4.0. Optional comma list of 2 to 4 platforms (linux/amd64,linux/arm64): one
+#                    buildx run pushes an OCI index to staging, every platform manifest is scanned and
+#                    gated, and the index and its platform images are promoted, signed and attested
+#                    only when EVERY platform passed. Results are written per platform
+#                    (lockbox/<os>-<arch>/result.json, with "index_digest"). One entry, or empty, is the
+#                    single-platform build of v2.3.0 (platform), unchanged.
+# Secrets (all optional)
+#   REGISTRY_USERNAME / REGISTRY_PASSWORD  default: github.actor / GITHUB_TOKEN (works for ghcr.io only).
+#   PULL_USERNAME / PULL_PASSWORD          build. Read-only credentials for base image pulls, sent ONLY to the
+#                    registries listed in the pull-hosts input (never to a host chosen by the Containerfile).
+#   COSIGN_PRIVATE_KEY / COSIGN_PASSWORD   signing: key only. Store them as ENVIRONMENT secrets.
+#
+# Security properties: every action is pinned by commit SHA and every image by digest
+# (integrations/test/check-github-pins.sh); the job token has only the four permissions
+# below; credentials are read from secrets into environment variables, passed to docker
+# login on stdin and never echoed; the registry credentials directory lives outside the
+# workspace and is deleted at the end; every external FROM is pinned to a digest before the
+# build; the workflow fails closed.
+
+name: lockbox-build
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: build (the only mode; scan-only was removed in v2.3.0).
+        type: string
+        default: build
+      image:
+        description: Release repository (no tag). Build mode only.
+        type: string
+        required: false
+        default: ""
+      staging-image:
+        description: Staging repository that workloads cannot pull. Must differ from image. Build mode only.
+        type: string
+        required: false
+        default: ""
+      trivy-image:
+        description: Trivy image pinned by digest.
+        type: string
+        required: true
+      severity:
+        description: Severities that fail the scan.
+        type: string
+        default: HIGH,CRITICAL
+      signing:
+        description: keyless, key or none.
+        type: string
+        default: keyless
+      cosign-key:
+        description: "signing: key. KMS URI, env://VAR or a key file."
+        type: string
+        default: env://COSIGN_PRIVATE_KEY
+      tlog-upload:
+        description: "signing: key. false skips the Rekor upload (offline)."
+        type: boolean
+        default: true
+      release-tag:
+        description: Release tag. Default is the commit SHA.
+        type: string
+        default: ""
+      trivy-db-repository:
+        description: "Offline only: Trivy vulnerability database mirror (host[:port]/path[:tag][@sha256:...]), a literal in the committed caller. Empty: Trivy's default."
+        type: string
+        default: ""
+      trivy-java-db-repository:
+        description: "Offline only: Trivy Java database mirror (host[:port]/path[:tag][@sha256:...]), a literal in the committed caller. Empty: Trivy's default."
+        type: string
+        default: ""
+      pull-hosts:
+        description: "build: comma-separated registry hosts that may receive PULL_USERNAME/PULL_PASSWORD for base image pulls. Empty: base pulls stay anonymous."
+        type: string
+        default: ""
+      lockbox-run-id:
+        description: Set by Lockbox when it triggers the run.
+        type: string
+        default: ""
+      lockbox-reason:
+        description: Set by Lockbox when it triggers the run (informational).
+        type: string
+        default: ""
+      context:
+        type: string
+        default: .
+      containerfile:
+        type: string
+        default: Containerfile
+      platform:
+        description: Single build platform (ignored when platforms lists two or more).
+        type: string
+        default: linux/amd64
+      platforms:
+        description: "Multi-platform build (v2.4.0): comma-separated list of 2 to 4 platforms, for example linux/amd64,linux/arm64. One entry is the same as platform. Empty: platform."
+        type: string
+        default: ""
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+      PULL_USERNAME:
+        required: false
+      PULL_PASSWORD:
+        required: false
+      COSIGN_PRIVATE_KEY:
+        required: false
+      COSIGN_PASSWORD:
+        required: false
+    outputs:
+      digest:
+        description: The bound digest (sha256:...) that was scanned (and, in build mode, promoted and signed).
+        value: ${{ jobs.build-scan-promote.outputs.digest }}
+
+permissions: {}
+
+jobs:
+  build-scan-promote:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.bound.outputs.digest }}
+    env:
+      LOCKBOX_MODE: ${{ inputs.mode }}
+      # Publishing (A1, promote, provenance, sign) only on protected refs, never for pull requests.
+      LOCKBOX_PUBLISH: ${{ github.ref_protected && github.event_name != 'pull_request' && github.event_name != 'pull_request_target' && github.event_name != 'merge_group' }}
+      LOCKBOX_BUILDER: buildx
+      LOCKBOX_IMAGE: ${{ inputs.image }}
+      LOCKBOX_STAGING_IMAGE: ${{ inputs.staging-image }}
+      LOCKBOX_TRIVY_IMAGE: ${{ inputs.trivy-image }}
+      LOCKBOX_SEVERITY: ${{ inputs.severity }}
+      LOCKBOX_TRIVY_DB_REPOSITORY: ${{ inputs.trivy-db-repository }}
+      LOCKBOX_TRIVY_JAVA_DB_REPOSITORY: ${{ inputs.trivy-java-db-repository }}
+      LOCKBOX_SIGNING: ${{ inputs.signing }}
+      LOCKBOX_COSIGN_KEY: ${{ inputs.cosign-key }}
+      LOCKBOX_TLOG_UPLOAD: ${{ inputs.tlog-upload }}
+      LOCKBOX_RELEASE_TAG: ${{ inputs.release-tag || github.sha }}
+      LOCKBOX_PULL_HOSTS: ${{ inputs.pull-hosts }}
+      LOCKBOX_RUN_ID: ${{ inputs.lockbox-run-id }}
+      LOCKBOX_REASON: ${{ inputs.lockbox-reason }}
+      LOCKBOX_CONTEXT: ${{ inputs.context }}
+      LOCKBOX_CONTAINERFILE: ${{ inputs.containerfile }}
+      LOCKBOX_PLATFORM: ${{ inputs.platform }}
+      LOCKBOX_PLATFORMS: ${{ inputs.platforms }}
+      LOCKBOX_PROVIDER: github
+      LOCKBOX_CI_RUN_ID: ${{ github.run_id }}
+      LOCKBOX_CI_RUN_ATTEMPT: ${{ github.run_attempt }}
+      LOCKBOX_COMMIT_SHA: ${{ github.sha }}
+      LOCKBOX_REF: ${{ github.ref }}
+      LOCKBOX_TEMPLATE_REF: ${{ github.workflow_ref }}
+      LOCKBOX_SOURCE_URI: ${{ github.server_url }}/${{ github.repository }}
+      LOCKBOX_BUILDER_ID: ${{ github.server_url }}/${{ github.workflow_ref }}
+      LOCKBOX_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+      # Pull-request mode (v2.2.0, T5.16): detected from the event, never an input. Empty otherwise.
+      # The values go through the environment, never into a script body.
+      LOCKBOX_PIPELINE_SOURCE: ${{ github.event_name }}
+      LOCKBOX_MR_IID: ${{ github.event.pull_request.number }}
+      LOCKBOX_MR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      LOCKBOX_MR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      LOCKBOX_MR_TARGET_BRANCH: ${{ github.base_ref }}
+      # Pinned tool images (tag for readability, digest is what is pulled).
+      LOCKBOX_CRANE_IMAGE: gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b
+      LOCKBOX_BUILDKIT_IMAGE: moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+    steps:
+      # The scripts are installed by two steps (part 1 and part 2, see sync.sh): actionlint
+      # stalls on a run script over 64 KiB.
+      - name: Install Lockbox scripts (part 1 of 2)
+        run: |
+          LOCKBOX_SCRIPTS="$RUNNER_TEMP/lockbox-scripts"
+          export LOCKBOX_SCRIPTS
+          {
+            echo "LOCKBOX_SCRIPTS=$LOCKBOX_SCRIPTS"
+            echo "DOCKER_CONFIG=$RUNNER_TEMP/lockbox-docker"
+          } >>"$GITHUB_ENV"
+          # BEGIN lockbox-scripts env guard login resolve build
+          mkdir -p "$LOCKBOX_SCRIPTS"
+          cat >"$LOCKBOX_SCRIPTS/env.sh" <<'LOCKBOX_EOF'
+          # env.sh: shared defaults and helpers, sourced (not executed) by the other
+          # scripts. See docs/design/scan-trust.md section 2.
+          #
+          # Contract (environment). Required: LOCKBOX_IMAGE, LOCKBOX_STAGING_IMAGE,
+          # LOCKBOX_TRIVY_IMAGE, LOCKBOX_CI_RUN_ID, LOCKBOX_COMMIT_SHA. Everything else has a default below or is optional.
+          # Design: docs/design/ci-templates.md (T2.11).
+          # shellcheck shell=sh
+
+          : "${LOCKBOX_MODE:=build}"
+          : "${LOCKBOX_BUILDER:=buildx}"
+          : "${LOCKBOX_WORK:=.lockbox-work}"
+          : "${LOCKBOX_DIR:=lockbox}"
+          : "${LOCKBOX_SIGNING:=keyless}"
+          : "${LOCKBOX_SEVERITY:=HIGH,CRITICAL}"
+          : "${LOCKBOX_TLOG_UPLOAD:=true}"
+          : "${LOCKBOX_CI_RUN_ATTEMPT:=1}"
+          : "${LOCKBOX_RELEASE_TAG:=${LOCKBOX_COMMIT_SHA:-}}"
+          : "${LOCKBOX_CONTEXT:=.}"
+          : "${LOCKBOX_CONTAINERFILE:=Containerfile}"
+
+          # Merge-request pipeline mode (v2.2.0, T5.16, validation-build.md section 7.1). It is
+          # DETECTED from the CI event the template maps into LOCKBOX_PIPELINE_SOURCE
+          # (GitLab CI_PIPELINE_SOURCE, GitHub github.event_name), never an input and never
+          # sent by Lockbox. In this mode the pipeline builds, pushes to the STAGING
+          # repository only, scans and gates; result.json says mode "mr"; the release
+          # repository, signing keys and attestations are never used.
+          LOCKBOX_MR=false
+          case ${LOCKBOX_PIPELINE_SOURCE:-} in
+            merge_request_event | pull_request) LOCKBOX_MR=true ;;
+          esac
+
+          # GitLab sets the source branch SHA only for merged-results and merge-train pipelines; in a
+          # detached pipeline the run's own commit is the merge request head.
+          if [ "$LOCKBOX_MR" = true ] && [ "${LOCKBOX_PROVIDER:-}" = gitlab ] && [ -z "${LOCKBOX_MR_HEAD_SHA:-}" ] && [ "${LOCKBOX_MR_EVENT_TYPE:-}" = detached ]; then
+            LOCKBOX_MR_HEAD_SHA=${LOCKBOX_COMMIT_SHA:-}
+          fi
+
+          # The staging tag is derived, never supplied: lockbox-<run id>-<attempt>, and
+          # lockbox-mr-<iid>-<run id>-<attempt> in merge-request mode (so registry cleanup
+          # can match it, ci-templates guide).
+          if [ "$LOCKBOX_MR" = true ]; then
+            LOCKBOX_STAGING_TAG="lockbox-mr-${LOCKBOX_MR_IID:-}-${LOCKBOX_CI_RUN_ID:-}-${LOCKBOX_CI_RUN_ATTEMPT}"
+          else
+            LOCKBOX_STAGING_TAG="lockbox-${LOCKBOX_CI_RUN_ID:-}-${LOCKBOX_CI_RUN_ATTEMPT}"
+          fi
+          LOCKBOX_STAGING_REF="${LOCKBOX_STAGING_IMAGE:-}:${LOCKBOX_STAGING_TAG}"
+          LOCKBOX_RELEASE_REF="${LOCKBOX_IMAGE:-}:${LOCKBOX_RELEASE_TAG}"
+          export LOCKBOX_MODE LOCKBOX_BUILDER LOCKBOX_WORK LOCKBOX_DIR LOCKBOX_SIGNING LOCKBOX_SEVERITY LOCKBOX_TLOG_UPLOAD
+          export LOCKBOX_CI_RUN_ATTEMPT LOCKBOX_RELEASE_TAG LOCKBOX_CONTEXT LOCKBOX_CONTAINERFILE
+          export LOCKBOX_MR LOCKBOX_MR_HEAD_SHA LOCKBOX_STAGING_TAG LOCKBOX_STAGING_REF LOCKBOX_RELEASE_REF
+
+          # Output directories of the signing jobs, derived, never supplied (T2.11c). On
+          # GitLab, lockbox:attest and lockbox:sign run as the cosign image's non-root
+          # uid, while lockbox/ and .lockbox-work/ arrive from earlier jobs' artifacts
+          # owned by root and 0755. Those jobs therefore write only into a directory they
+          # create themselves (fresh_dir), and the signed inputs stay writable by their
+          # owner only.
+          #   LOCKBOX_ATTEST_DIR  vuln.sh, attest.sh: vuln-predicate.json,
+          #                       vuln-statement.json, vuln.sigstore.json (the
+          #                       lockbox:attest artifact; sign.sh reads the predicate)
+          #   LOCKBOX_SIGN_DIR    provenance.sh: provenance.json (sign.sh, actions/attest)
+          LOCKBOX_ATTEST_DIR=lockbox-attest
+          LOCKBOX_SIGN_DIR=.lockbox-sign
+
+          export LOCKBOX_ATTEST_DIR LOCKBOX_SIGN_DIR
+
+          fail() {
+            printf 'lockbox: %s\n' "$*" >&2
+            exit 1
+          }
+
+          # matches REGEX VALUE: true when VALUE matches the extended regex. A value
+          # with a newline never matches (grep is line based and would test each line).
+          matches() {
+            case $2 in
+              *'
+          '*) return 1 ;;
+            esac
+            printf '%s\n' "$2" | grep -Eq "$1"
+          }
+
+          # valid_mirror REF: REF is a Trivy database mirror reference with an explicit
+          # registry host: host[:port]/path[:tag][@sha256:<64 hex>], lowercase host and
+          # path (core's scan.ValidMirrorRef and the GitLab input regex are the same).
+          valid_mirror() {
+            [ "${#1}" -le 512 ] || return 1
+            matches '^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+(:[A-Za-z0-9_][A-Za-z0-9._-]{0,127})?(@sha256:[0-9a-f]{64})?$' "$1" || return 1
+            case ${1%%/*} in
+              *.* | *:* | localhost) return 0 ;;
+            esac
+            return 1
+          }
+
+          # digest_of: the bound digest D written by digest.sh (a platform context: the platform
+          # manifest digest; multi-platform parent: the index digest).
+          digest_of() {
+            if [ -n "${LOCKBOX_PLATFORM_DIGEST:-}" ]; then # a platform context: the platform manifest digest
+              printf '%s' "$LOCKBOX_PLATFORM_DIGEST"
+              return 0
+            fi
+            [ -s "$LOCKBOX_WORK/digest" ] || fail "no bound digest (digest step did not run)"
+            d=$(cat "$LOCKBOX_WORK/digest")
+            matches '^sha256:[0-9a-f]{64}$' "$d" || fail "malformed bound digest"
+            printf '%s' "$d"
+          }
+
+          # fresh_dir DIR: (re)create DIR, owned by the current uid, mode 0755. Fails
+          # closed when an existing DIR cannot be removed (it then came from someone else).
+          fresh_dir() {
+            rm -rf "$1"
+            [ ! -e "$1" ] || fail "cannot replace $1"
+            (umask 022 && mkdir "$1")
+          }
+
+          # esc VALUE: a JSON string body (control characters dropped, backslash and
+          # double quote escaped). jq is not assumed.
+          esc() {
+            printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          # sha256_of FILE: the hex sha256 (busybox and GNU sha256sum, or macOS shasum).
+          sha256_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d ' ' -f 1
+            else
+              shasum -a 256 "$1" | cut -d ' ' -f 1
+            fi
+          }
+
+          # resolve_staging_digest: the digest the REGISTRY serves for the staging tag
+          # is the bound digest D; written to $LOCKBOX_WORK/digest. Never the local image ID.
+          resolve_staging_digest() {
+            d=$(crane digest "$LOCKBOX_STAGING_REF")
+            matches '^sha256:[0-9a-f]{64}$' "$d" || fail "the registry returned a malformed digest for the staging tag"
+            mkdir -p "$LOCKBOX_WORK"
+            printf '%s\n' "$d" >"$LOCKBOX_WORK/digest"
+            echo "lockbox: bound digest $d"
+            if [ "$LOCKBOX_MULTI" = true ]; then write_platform_digests "$d"; fi
+          }
+
+          # Multi-platform builds (v2.4.0, P32). LOCKBOX_PLATFORMS is a comma list such as
+          # linux/amd64,linux/arm64 (at most 4 entries). One entry is exactly LOCKBOX_PLATFORM
+          # (the single-platform path, byte for byte as v2.3.0); two or more switch on the
+          # multi-platform path:
+          #   - each platform is built to staging (GitLab: one build job per slot, LOCKBOX_SLOT
+          #     1..4 selects the platform; GitHub: one buildx run with --platform), and an OCI
+          #     index of them is the staging image; the bound digest ($LOCKBOX_WORK/digest) is
+          #     the INDEX digest, and $LOCKBOX_WORK/platform-digests lists "slug platform
+          #     digest" per platform, derived from the index the registry serves;
+          #   - scan, result, vuln, attest, provenance and sign run once per platform, in that
+          #     platform's context (LOCKBOX_SLUG, set only by run_each): outputs go to
+          #     lockbox/<slug>/, .lockbox-work/p/<slug>/, lockbox-attest/<slug>/ and
+          #     .lockbox-sign/<slug>/, the bound digest is the PLATFORM manifest digest and
+          #     LOCKBOX_INDEX_DIGEST is the index digest;
+          #   - gate, promote and the aggregate $LOCKBOX_WORK/passed work on the index and need
+          #     every platform to pass.
+          LOCKBOX_MULTI=false
+          LOCKBOX_SLOT_SUFFIX=
+          if [ -n "${LOCKBOX_PLATFORMS:-}" ]; then
+            _pre='[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?'
+            matches "^$_pre(,$_pre)*\$" "$LOCKBOX_PLATFORMS" || fail "platforms must be a comma-separated list like linux/amd64,linux/arm64"
+            _n=0
+            _seen=,
+            _oldifs=$IFS
+            IFS=,
+            for _p in $LOCKBOX_PLATFORMS; do
+              case $_seen in *",$_p,"*) fail "platforms lists $_p twice" ;; esac
+              _seen="$_seen$_p,"
+              _n=$((_n + 1))
+              _one=$_p
+            done
+            IFS=$_oldifs
+            [ "$_n" -le 4 ] || fail "platforms lists at most 4 platforms"
+            if [ "$_n" -eq 1 ]; then
+              LOCKBOX_PLATFORM=$_one
+              LOCKBOX_PLATFORMS=
+            else
+              LOCKBOX_MULTI=true
+              LOCKBOX_PLATFORM=$LOCKBOX_PLATFORMS
+              if [ -n "${LOCKBOX_SLOT:-}" ]; then
+                # A build slot (GitLab): the platform at that position builds, and its layout
+                # and built digest get a suffix so the slots' artifacts do not overlap.
+                matches '^[1-4]$' "$LOCKBOX_SLOT" || fail "LOCKBOX_SLOT must be 1 to 4"
+                [ "$LOCKBOX_SLOT" -le "$_n" ] || fail "LOCKBOX_SLOT is beyond the platform list"
+                _i=0
+                IFS=,
+                for _p in $LOCKBOX_PLATFORMS; do
+                  _i=$((_i + 1))
+                  [ "$_i" -eq "$LOCKBOX_SLOT" ] && LOCKBOX_PLATFORM=$_p
+                done
+                IFS=$_oldifs
+                [ "$LOCKBOX_SLOT" -eq 1 ] || LOCKBOX_SLOT_SUFFIX="-$LOCKBOX_SLOT"
+              fi
+            fi
+          fi
+          LOCKBOX_PLATFORMS=${LOCKBOX_PLATFORMS:-}
+          LOCKBOX_INDEX_DIGEST=
+          LOCKBOX_PLATFORM_DIGEST=
+
+          # A per-platform context (run_each sets LOCKBOX_SLUG, nothing else supplies it; guard.sh
+          # refuses it as a variable). The slug must be one recorded by the push or digest step.
+          if [ -n "${LOCKBOX_SLUG:-}" ]; then
+            [ "$LOCKBOX_MULTI" = true ] || fail "a platform context needs a multi-platform build"
+            matches '^[a-z0-9]+(-[a-z0-9]+)*$' "$LOCKBOX_SLUG" || fail "malformed platform slug"
+            _line=$(awk -v s="$LOCKBOX_SLUG" '$1 == s { print; exit }' "$LOCKBOX_WORK/platform-digests" 2>/dev/null || true)
+            [ -n "$_line" ] || fail "platform $LOCKBOX_SLUG is not in the platform digests"
+            _plat=$(printf '%s\n' "$_line" | awk '{ print $2 }')
+            _pd=$(printf '%s\n' "$_line" | awk '{ print $3 }')
+            matches '^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?$' "$_plat" || fail "malformed platform record"
+            matches '^sha256:[0-9a-f]{64}$' "$_pd" || fail "malformed platform digest"
+            _idx=$(cat "$LOCKBOX_WORK/digest" 2>/dev/null || true)
+            matches '^sha256:[0-9a-f]{64}$' "$_idx" || fail "malformed index digest"
+            LOCKBOX_PLATFORM=$_plat
+            LOCKBOX_PLATFORM_DIGEST=$_pd
+            LOCKBOX_INDEX_DIGEST=$_idx
+            LOCKBOX_WORK_BASE=$LOCKBOX_WORK
+            LOCKBOX_WORK="$LOCKBOX_WORK/p/$LOCKBOX_SLUG"
+            LOCKBOX_DIR="$LOCKBOX_DIR/$LOCKBOX_SLUG"
+            LOCKBOX_ATTEST_DIR="$LOCKBOX_ATTEST_DIR/$LOCKBOX_SLUG"
+            LOCKBOX_SIGN_DIR="$LOCKBOX_SIGN_DIR/$LOCKBOX_SLUG"
+          fi
+          : "${LOCKBOX_WORK_BASE:=$LOCKBOX_WORK}"
+          export LOCKBOX_PLATFORM LOCKBOX_PLATFORMS LOCKBOX_MULTI LOCKBOX_SLOT_SUFFIX LOCKBOX_WORK LOCKBOX_WORK_BASE LOCKBOX_DIR LOCKBOX_INDEX_DIGEST
+          export LOCKBOX_ATTEST_DIR LOCKBOX_SIGN_DIR
+
+          # multi_parent: true in the multi-platform job context that fans out over the platforms.
+          multi_parent() { [ "$LOCKBOX_MULTI" = true ] && [ -z "${LOCKBOX_SLUG:-}" ]; }
+
+          # run_each SCRIPT: run SCRIPT once per recorded platform, each in its own context
+          # (env.sh turns LOCKBOX_SLUG into the per-platform directories and digest). The first
+          # failure stops the run; a script that records a failed gate rather than failing (scan.sh)
+          # does not stop it.
+          run_each() {
+            [ -s "$LOCKBOX_WORK/platform-digests" ] || fail "no platform digests (the push or digest step did not run)"
+            while read -r _slug _rest; do
+              [ -n "$_slug" ] || continue
+              LOCKBOX_SLUG=$_slug sh "$1" </dev/null || exit 1
+            done <"$LOCKBOX_WORK/platform-digests"
+          }
+
+          # index_platforms REF: one line "os/arch[/variant] sha256:<hex>" per image child of the
+          # OCI index REF, read from the manifest the registry serves (crane manifest). Attestation
+          # manifests (unknown/unknown) are skipped. No jq: the manifest is put on one line, cut into
+          # one line per descriptor at the "},{" between array items, and each is read with grep.
+          index_platforms() {
+            crane manifest "$1" | tr -d ' \n\r\t' | sed 's/},{"/}\
+          {"/g' | while read -r _desc || [ -n "$_desc" ]; do
+              _d=$(printf '%s\n' "$_desc" | grep -o '"digest":"sha256:[0-9a-f]*"' | head -n 1 | cut -d '"' -f 4)
+              _os=$(printf '%s\n' "$_desc" | grep -o '"os":"[^"]*"' | head -n 1 | cut -d '"' -f 4)
+              _ar=$(printf '%s\n' "$_desc" | grep -o '"architecture":"[^"]*"' | head -n 1 | cut -d '"' -f 4)
+              _va=$(printf '%s\n' "$_desc" | grep -o '"variant":"[^"]*"' | head -n 1 | cut -d '"' -f 4)
+              [ -n "$_d" ] && [ -n "$_os" ] && [ -n "$_ar" ] || continue
+              [ "$_os" != unknown ] && [ "$_ar" != unknown ] || continue
+              if [ -n "$_va" ]; then printf '%s/%s/%s %s\n' "$_os" "$_ar" "$_va" "$_d"; else printf '%s/%s %s\n' "$_os" "$_ar" "$_d"; fi
+            done
+          }
+
+          # write_platform_digests INDEX_DIGEST: multi-platform, after the staging index is pushed.
+          # Records "slug platform digest" per requested platform, in request order, from what the
+          # registry serves for the index: every requested platform must be a child exactly once and
+          # the index must have no other image child. A requested platform without a variant matches
+          # a child with any variant.
+          write_platform_digests() {
+            _list=$(index_platforms "$LOCKBOX_STAGING_IMAGE@$1") || fail "could not read the staging index"
+            _want=$(printf '%s' "$LOCKBOX_PLATFORMS" | tr ',' '\n' | wc -l | tr -d ' ')
+            _want=$((_want + 1))
+            _have=$(printf '%s\n' "$_list" | grep -c . || true)
+            [ "$_have" -eq "$_want" ] || fail "the staging index has $_have platform image(s), $_want requested"
+            : >"$LOCKBOX_WORK/platform-digests.new"
+            _oldifs=$IFS
+            IFS=,
+            for _p in $LOCKBOX_PLATFORMS; do
+              IFS=$_oldifs
+              _hits=$(printf '%s\n' "$_list" | awk -v w="$_p" 'BEGIN { split(w, b, "/") } { split($1, a, "/"); if (a[1] == b[1] && a[2] == b[2] && (b[3] == "" || a[3] == b[3])) print $2 }')
+              [ "$(printf '%s\n' "$_hits" | grep -c .)" -eq 1 ] || fail "the staging index does not hold exactly one image for $_p"
+              printf '%s %s %s\n' "$(printf '%s' "$_p" | tr / -)" "$_p" "$_hits" >>"$LOCKBOX_WORK/platform-digests.new"
+              IFS=,
+            done
+            IFS=$_oldifs
+            mv "$LOCKBOX_WORK/platform-digests.new" "$LOCKBOX_WORK/platform-digests"
+            echo "lockbox: index $1 holds $_want platform image(s)"
+          }
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/guard.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # guard.sh: refuse unsafe or ambiguous inputs before anything is built,
+          # pushed or signed (design section 2: staging-image must be set and differ
+          # from image, so that D2 "scan before publishing" holds by construction).
+          # Mode (ci-templates.md section 2): build. scan-only was removed in v2.3.0.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          repo_re='^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+$'
+          host_re='^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$'
+          needs_host() { # needs_host WHAT REF: the registry host must be explicit
+            case ${2%%/*} in
+              *.* | *:* | localhost) ;;
+              *) fail "$1 must name the registry host explicitly" ;;
+            esac
+          }
+
+          # The test hooks must never reach a real pipeline (ci-templates.md section 3.3).
+          if [ -n "${LOCKBOX_HARNESS:-}" ] && { [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; }; then
+            fail "LOCKBOX_HARNESS must not be set in a CI pipeline"
+          fi
+
+          case $LOCKBOX_MODE in
+            build) ;;
+            scan-only) fail "scan-only mode was removed; the in-cluster scanner covers images CI did not build" ;;
+            *) fail "mode must be build" ;;
+          esac
+
+          [ -n "${LOCKBOX_IMAGE:-}" ] || fail "image is required"
+          [ -n "${LOCKBOX_STAGING_IMAGE:-}" ] || fail "staging-image is required: a repository that workloads cannot pull"
+          matches "$repo_re" "$LOCKBOX_IMAGE" || fail "image must be <host>/<path>, lowercase, without tag or digest"
+          matches "$repo_re" "$LOCKBOX_STAGING_IMAGE" || fail "staging-image must be <host>/<path>, lowercase, without tag or digest"
+          needs_host "image references" "$LOCKBOX_IMAGE"
+          needs_host "image references" "$LOCKBOX_STAGING_IMAGE"
+          [ "$LOCKBOX_IMAGE" != "$LOCKBOX_STAGING_IMAGE" ] || fail "staging-image must differ from image"
+          matches '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$' "$LOCKBOX_RELEASE_TAG" || fail "release-tag is empty or not a valid tag"
+          matches '^[A-Za-z0-9_./-]+$' "$LOCKBOX_CONTEXT" || fail "context has invalid characters"
+          matches '^[A-Za-z0-9_./-]+$' "$LOCKBOX_CONTAINERFILE" || fail "containerfile has invalid characters"
+          case $LOCKBOX_CONTEXT$LOCKBOX_CONTAINERFILE in -* | *..*) fail "context and containerfile must stay inside the workspace" ;; esac
+          case $LOCKBOX_CONTEXT in -*) fail "context must not start with a dash" ;; esac
+          case $LOCKBOX_CONTAINERFILE in -*) fail "containerfile must not start with a dash" ;; esac
+          # An absolute path would let the build read the registry credentials
+          # directory (kaniko) or $RUNNER_TEMP (buildx) (review T2.17 L1).
+          case $LOCKBOX_CONTEXT in /*) fail "context must be a relative path inside the workspace" ;; esac
+          case $LOCKBOX_CONTAINERFILE in /*) fail "containerfile must be a relative path inside the workspace" ;; esac
+          if [ "$LOCKBOX_MULTI" = true ]; then
+            # env.sh already validated the list (v2.4.0): 2 to 4 distinct os/arch[/variant] entries.
+            [ -z "${LOCKBOX_SLUG:-}" ] || fail "LOCKBOX_SLUG is set by Lockbox's scripts only"
+          else
+            matches '^([a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?)?$' "${LOCKBOX_PLATFORM:-}" || fail "platform must look like linux/amd64"
+            [ "${LOCKBOX_SLOT:-1}" = 1 ] || fail "LOCKBOX_SLOT above 1 needs LOCKBOX_PLATFORMS with that many platforms"
+          fi
+          # Images mode (GitLab template v2.5.0): the settings came from lockbox:images through imgload.sh.
+          # Re-check that they belong together; LOCKBOX_IMAGE_NAME is the third Lockbox-set variable.
+          if [ -n "${LOCKBOX_IMAGE_NAME:-}" ]; then
+            matches '^[a-z0-9][a-z0-9._-]{0,63}$' "$LOCKBOX_IMAGE_NAME" || fail "LOCKBOX_IMAGE_NAME is not a valid image name"
+          fi
+          if [ -n "${LOCKBOX_IMAGES_DIR:-}" ]; then
+            [ -n "${LOCKBOX_IMAGE_NAME:-}" ] || fail "images mode: no image was chosen (LOCKBOX_IMAGE_NAME is empty)"
+            [ "${#LOCKBOX_IMAGES_DIR}" -le 128 ] && matches '^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$' "$LOCKBOX_IMAGES_DIR" || fail "images mode: the images directory is not a safe relative path"
+            [ "$LOCKBOX_CONTEXT" = "$LOCKBOX_IMAGES_DIR/$LOCKBOX_IMAGE_NAME" ] || fail "images mode: the context must be $LOCKBOX_IMAGES_DIR/$LOCKBOX_IMAGE_NAME"
+            [ "$LOCKBOX_CONTAINERFILE" = "$LOCKBOX_CONTEXT/Containerfile" ] || fail "images mode: the Containerfile must be $LOCKBOX_CONTEXT/Containerfile"
+          fi
+          case $LOCKBOX_BUILDER in kaniko | buildx) ;; *) fail "builder must be kaniko or buildx" ;; esac
+          oldifs=$IFS
+          IFS=,
+          for h in ${LOCKBOX_PULL_HOSTS:-}; do
+            [ -n "$h" ] || continue
+            matches "$host_re" "$h" || fail "pull-hosts must be comma-separated registry hosts"
+          done
+          IFS=$oldifs
+          [ -z "${LOCKBOX_PULL_PASSWORD:-}" ] || [ -n "${LOCKBOX_PULL_USER:-}" ] || fail "pull password without a pull user"
+
+          matches '@sha256:[0-9a-f]{64}$' "${LOCKBOX_TRIVY_IMAGE:-}" || fail "trivy-image must be pinned by digest (name:tag@sha256:...)"
+          matches '^(UNKNOWN|LOW|MEDIUM|HIGH|CRITICAL)(,(UNKNOWN|LOW|MEDIUM|HIGH|CRITICAL))*$' "$LOCKBOX_SEVERITY" || fail "severity must be a comma-separated list of UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL"
+          for m in "${LOCKBOX_TRIVY_DB_REPOSITORY:-}" "${LOCKBOX_TRIVY_JAVA_DB_REPOSITORY:-}"; do
+            [ -z "$m" ] || valid_mirror "$m" || fail "trivy-db-repository and trivy-java-db-repository must be OCI references with an explicit registry host (host[:port]/path[:tag][@sha256:...])"
+          done
+          # pull_request_target runs with the base repository's secrets on the pull request's code: never.
+          [ "${LOCKBOX_PIPELINE_SOURCE:-}" != pull_request_target ] || fail "pull_request_target is not supported: use pull_request"
+          if [ "$LOCKBOX_MR" = true ]; then
+            # Merge-request pipeline mode (T5.16): evidence only, never a release.
+            [ "${LOCKBOX_PUBLISH:-false}" != true ] || fail "a merge request pipeline never publishes"
+            matches '^[0-9]+$' "${LOCKBOX_MR_IID:-}" || fail "merge request number must be numeric"
+            matches '^([0-9a-f]{40}|[0-9a-f]{64})$' "${LOCKBOX_MR_HEAD_SHA:-}" || fail "merge request head sha is not a full hex sha"
+            case ${LOCKBOX_PROVIDER:-} in
+              gitlab)
+                matches '^[0-9]+$' "${LOCKBOX_MR_PROJECT_ID:-}" || fail "merge request project id must be numeric"
+                matches '^[0-9]+$' "${LOCKBOX_MR_SOURCE_PROJECT_ID:-}" || fail "merge request source project id must be numeric"
+                case ${LOCKBOX_MR_EVENT_TYPE:-} in detached | merged_result | merge_train) ;; *) fail "merge request event type must be detached, merged_result or merge_train" ;; esac
+                ;;
+              github) matches '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$' "${LOCKBOX_MR_HEAD_REPO:-}" || fail "pull request head repository is malformed" ;;
+            esac
+            [ -n "${LOCKBOX_MR_TARGET_BRANCH:-}" ] || fail "merge request target branch is empty"
+          fi
+          matches '^[0-9]+$' "${LOCKBOX_CI_RUN_ID:-}" || fail "CI run id must be numeric"
+          matches '^[0-9]+$' "$LOCKBOX_CI_RUN_ATTEMPT" || fail "CI run attempt must be numeric"
+          matches '^([0-9a-f]{40}|[0-9a-f]{64})$' "${LOCKBOX_COMMIT_SHA:-}" || fail "commit sha is not a full hex sha"
+          matches '^[A-Za-z0-9._-]{0,64}$' "${LOCKBOX_RUN_ID:-}" || fail "lockbox-run-id has invalid characters"
+          case ${LOCKBOX_REASON:-} in
+            '' | schedule | upstream | emergency | manual | third-party) ;;
+            *) fail "lockbox-reason must be empty or one of schedule, upstream, emergency, manual, third-party" ;;
+          esac
+
+          case $LOCKBOX_SIGNING in
+            keyless)
+              [ "$LOCKBOX_TLOG_UPLOAD" = true ] || fail "keyless signing needs the transparency log; use signing: key for offline use"
+              ;;
+            key)
+              [ -n "${LOCKBOX_COSIGN_KEY:-}" ] || fail "signing: key needs cosign-key (KMS URI, env://VAR or key file)"
+              case $LOCKBOX_TLOG_UPLOAD in true | false) ;; *) fail "tlog-upload must be true or false" ;; esac
+              ;;
+            none) echo "lockbox: signing none: Lockbox will treat these scan results as untrusted" >&2 ;;
+            *) fail "signing must be keyless, key or none" ;;
+          esac
+
+          if [ "$LOCKBOX_MR" = true ]; then
+            echo "lockbox: inputs ok (merge request mode, staging tag $LOCKBOX_STAGING_TAG, nothing is promoted or signed)"
+          else
+            echo "lockbox: inputs ok (staging tag $LOCKBOX_STAGING_TAG, release tag $LOCKBOX_RELEASE_TAG)"
+          fi
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/login.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # login.sh: registry login with the password on stdin only (never on a command
+          # line, never echoed). LOCKBOX_LOGIN_TOOL is docker (default), crane, cosign or
+          # config (writes config.json directly, for kaniko and Trivy; ci-templates.md
+          # section 8). The credentials file goes to DOCKER_CONFIG, which must be outside
+          # the workspace so it can never be uploaded as an artifact. With no password the
+          # run stays anonymous.
+          #
+          # LOCKBOX_LOGIN_SCOPE selects the hosts and credentials:
+          #   push (default)  the hosts of image and staging-image, registry credentials.
+          #   pull            the kaniko job: the hosts of the base images in materials.txt that
+          #                   equal the host of image or staging-image, with the read-only
+          #                   LOCKBOX_PULL_USER/PASSWORD (default: the registry credentials, with a warning).
+          #   bases           GitHub, after resolve: base image hosts that are listed in the
+          #                   LOCKBOX_PULL_HOSTS allow-list (and are not the image or staging host),
+          #                   only when pull credentials are supplied. A host named only by the
+          #                   Containerfile never receives them.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          scope=${LOCKBOX_LOGIN_SCOPE:-push}
+          tool=${LOCKBOX_LOGIN_TOOL:-docker}
+          user=${LOCKBOX_REGISTRY_USER:-}
+          password=${LOCKBOX_REGISTRY_PASSWORD:-}
+          case $scope in
+            push) ;;
+            pull | bases)
+              if [ -n "${LOCKBOX_PULL_PASSWORD:-}" ]; then
+                user=${LOCKBOX_PULL_USER:-}
+                password=$LOCKBOX_PULL_PASSWORD
+              elif [ "$scope" = bases ]; then
+                echo "lockbox: no pull credentials supplied, base images are pulled anonymously"
+                exit 0
+              elif [ -n "$password" ]; then
+                echo "lockbox: no read-only pull credentials; the build job holds the registry credentials (see guide)" >&2
+              fi
+              ;;
+            *) fail "LOCKBOX_LOGIN_SCOPE must be push, pull or bases" ;;
+          esac
+
+          if [ -z "$password" ]; then
+            echo "lockbox: no registry credentials supplied, continuing anonymously"
+            exit 0
+          fi
+          [ -n "$user" ] || fail "registry password without a user"
+          [ -n "${DOCKER_CONFIG:-}" ] || fail "DOCKER_CONFIG must be set when credentials are used"
+          case $DOCKER_CONFIG in
+            /*) ;;
+            *) fail "DOCKER_CONFIG must be an absolute path outside the workspace" ;;
+          esac
+          case $DOCKER_CONFIG in
+            "$PWD" | "$PWD"/*) fail "DOCKER_CONFIG must be outside the workspace" ;;
+          esac
+
+          # The hosts that may receive the credentials.
+          base_hosts() { # hosts of the base images recorded by resolve.sh
+            [ -s "$LOCKBOX_WORK/materials.txt" ] || return 0
+            while read -r purl _; do
+              repo=${purl#pkg:docker/}
+              first=${repo%%/*}
+              [ "$first" != "$repo" ] || continue
+              case $first in
+                *.* | *:* | localhost) printf '%s\n' "$first" ;;
+              esac
+            done <"$LOCKBOX_WORK/materials.txt"
+          }
+          hosts=""
+          add_host() {
+            case " $hosts " in *" $1 "*) ;; *) hosts="$hosts $1" ;; esac
+          }
+          image_host=${LOCKBOX_IMAGE:-}
+          image_host=${image_host%%/*}
+          staging_host=${LOCKBOX_STAGING_IMAGE:-}
+          staging_host=${staging_host%%/*}
+          case $scope in
+            push)
+              # Merge-request pipelines (T5.16) touch the staging repository only: no credentials
+              # for the release repository's host.
+              [ "$LOCKBOX_MR" = true ] || add_host "$image_host"
+              add_host "$staging_host"
+              ;;
+            pull)
+              for h in $(base_hosts); do
+                if [ "$h" = "$image_host" ] || [ "$h" = "$staging_host" ]; then add_host "$h"; fi
+              done
+              ;;
+            bases)
+              for h in $(base_hosts); do
+                [ "$h" != "$image_host" ] && [ "$h" != "$staging_host" ] || continue
+                oldifs=$IFS
+                IFS=,
+                for allowed in ${LOCKBOX_PULL_HOSTS:-}; do
+                  [ "$allowed" = "$h" ] && add_host "$h"
+                done
+                IFS=$oldifs
+              done
+              ;;
+          esac
+          if [ -z "$hosts" ]; then
+            echo "lockbox: no registry host needs credentials"
+            exit 0
+          fi
+
+          umask 077
+          mkdir -p "$DOCKER_CONFIG"
+          chmod 700 "$DOCKER_CONFIG"
+
+          case $tool in
+            config)
+              # printf is a shell builtin: the password never appears in a process argument list.
+              auth=$(printf '%s:%s' "$user" "$password" | base64 | tr -d '\n')
+              cfg="$DOCKER_CONFIG/config.json"
+              printf '{"auths":{' >"$cfg"
+              sep=""
+              for host in $hosts; do
+                printf '%s"%s":{"auth":"%s"}' "$sep" "$host" "$auth" >>"$cfg"
+                sep=","
+                echo "lockbox: credentials configured for $host"
+              done
+              printf '}}\n' >>"$cfg"
+              chmod 600 "$cfg"
+              ;;
+            docker | crane | cosign)
+              for host in $hosts; do
+                case $tool in
+                  docker) printf '%s' "$password" | docker login "$host" --username "$user" --password-stdin >/dev/null ;;
+                  crane) printf '%s' "$password" | crane auth login "$host" --username "$user" --password-stdin >/dev/null ;;
+                  cosign) printf '%s' "$password" | cosign login "$host" --username "$user" --password-stdin >/dev/null ;;
+                esac
+                echo "lockbox: logged in to $host"
+              done
+              ;;
+            *) fail "LOCKBOX_LOGIN_TOOL must be docker, crane, cosign or config" ;;
+          esac
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/resolve.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # resolve.sh: pin every external image reference of the Containerfile to a
+          # digest BEFORE the build (ci-templates.md section 3.2). Needs crane, awk (POSIX,
+          # busybox-compatible) and sha256sum or shasum.
+          #   input   $LOCKBOX_CONTAINERFILE (relative to the workspace)
+          #   output  $LOCKBOX_WORK/Containerfile.pinned  the Containerfile with each external ref
+          #                                                written as <repo as written>@sha256:<hex>
+          #           $LOCKBOX_WORK/materials.txt          "<purl> <hex>" lines, sorted, unique
+          #           $LOCKBOX_WORK/containerfile.sha256   sha256 of the pinned copy
+          # The build uses the pinned copy, so the pinned set IS what the build pulled and
+          # resolvedDependencies never depends on a builder's record. External refs are the
+          # FROM images and COPY --from images that are not "scratch", a stage name or a
+          # stage index. Refused: ARG without default in a FROM, RUN --mount from an image,
+          # a ref split across continuation lines. Any resolution error fails the job; there
+          # is no fallback to the unpinned ref.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          [ -f "$LOCKBOX_CONTAINERFILE" ] || fail "containerfile not found: $LOCKBOX_CONTAINERFILE"
+          mkdir -p "$LOCKBOX_WORK"
+          rm -f "$LOCKBOX_WORK/Containerfile.pinned" "$LOCKBOX_WORK/materials.txt" "$LOCKBOX_WORK/containerfile.sha256"
+          tmp=$(mktemp -d "${TMPDIR:-/tmp}/lockbox-resolve.XXXXXX")
+          trap 'rm -rf "$tmp"' EXIT
+
+          cat >"$tmp/resolve.awk" <<'AWK'
+          # mode=scan: print every external ref (after ARG substitution), one per line.
+          # mode=rewrite: print the Containerfile with those refs replaced via mapfile
+          # (lines "<ref><TAB><pinned>").
+          function die(msg) {
+            print "lockbox: " msg > "/dev/stderr"
+            failed = 1
+            exit 1
+          }
+          function emit(l) {
+            if (mode == "rewrite") print l
+          }
+          function tokenize(s,    i, c, inT, L) {
+            n = 0
+            inT = 0
+            L = length(s)
+            for (i = 1; i <= L; i++) {
+              c = substr(s, i, 1)
+              if (c == " " || c == "\t") {
+                if (inT) { te[n] = i - 1; inT = 0 }
+              } else if (!inT) {
+                n++
+                ts[n] = i
+                inT = 1
+              }
+            }
+            if (inT) te[n] = L
+            for (i = 1; i <= n; i++) tk[i] = substr(s, ts[i], te[i] - ts[i] + 1)
+          }
+          function subst(s,    out, name, m) {
+            out = ""
+            unresolved = ""
+            while (match(s, /\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)/)) {
+              m = substr(s, RSTART, RLENGTH)
+              name = m
+              gsub(/[${}]/, "", name)
+              out = out substr(s, 1, RSTART - 1)
+              if (name in argval) out = out argval[name]
+              else { if (unresolved == "") unresolved = name; out = out m }
+              s = substr(s, RSTART + RLENGTH)
+            }
+            return out s
+          }
+          function internal(x) {
+            return (x ~ /^[0-9]+$/) || (tolower(x) in stage)
+          }
+          # edit TOKEN-INDEX SKIP VALUE: the ref starts SKIP characters into the token.
+          function edit(i, skip, value,    s, e, k) {
+            s = ts[i] + skip
+            e = te[i]
+            for (k = 1; k <= np; k++) if (!skipf[k] && s > base[k] && s <= base[k] + blen[k]) break
+            if (k > np) die("internal error locating " value)
+            if (e > base[k] + blen[k]) die("image reference split across lines: " value)
+            if (mode == "scan") { print value; return }
+            if (!(value in pin)) die("internal error: " value " was not resolved")
+            ne++
+            ek[ne] = k
+            eo[ne] = s - base[k]
+            el[ne] = e - s + 1
+            er[ne] = pin[value]
+          }
+          function process(    ins, i, j, nm, v, a, np2, parts, x, p, w) {
+            tokenize(logical)
+            if (n == 0) return
+            ins = toupper(tk[1])
+            if (ins == "ARG" && !seenfrom) {
+              for (i = 2; i <= n; i++) {
+                v = tk[i]
+                p = index(v, "=")
+                if (p == 0) { delete argval[v]; continue }
+                nm = substr(v, 1, p - 1)
+                v = substr(v, p + 1)
+                if (v ~ /^".*"$/ || v ~ /^'.*'$/) v = substr(v, 2, length(v) - 2)
+                argval[nm] = subst(v)
+              }
+            } else if (ins == "FROM") {
+              seenfrom = 1
+              i = 2
+              while (i <= n && tk[i] ~ /^--/) i++
+              if (i > n) die("FROM without an image")
+              v = subst(tk[i])
+              if (index(v, "$") > 0) die("FROM uses ARG " (unresolved == "" ? "?" : unresolved) " without a default; build args are not supported")
+              nm = ""
+              if (toupper(tk[i + 1]) == "AS" && (i + 2) <= n) nm = tolower(tk[i + 2])
+              if (tolower(v) != "scratch" && !(tolower(v) in stage)) edit(i, 0, v)
+              if (nm != "") stage[nm] = 1
+            } else if (ins == "COPY" || ins == "ADD") {
+              for (i = 2; i <= n && tk[i] ~ /^--/; i++) {
+                if (tk[i] ~ /^--from=/) {
+                  x = substr(tk[i], 8)
+                  if (index(x, "$") > 0) die(ins " --from uses a variable reference; not supported")
+                  if (!internal(x)) edit(i, 7, x)
+                }
+              }
+            } else if (ins == "RUN") {
+              for (i = 2; i <= n && tk[i] ~ /^--/; i++) {
+                if (tk[i] ~ /^--mount=/) {
+                  np2 = split(substr(tk[i], 9), parts, ",")
+                  for (j = 1; j <= np2; j++) {
+                    if (parts[j] ~ /^from=/) {
+                      x = substr(parts[j], 6)
+                      if (!internal(x)) die("RUN --mount from an image is not supported")
+                    }
+                  }
+                }
+              }
+            }
+            if (ins == "RUN" || ins == "COPY" || ins == "ADD") {
+              for (i = 2; i <= n; i++) {
+                if (tk[i] ~ /^<<-?["']?[A-Za-z_][A-Za-z0-9_]*["']?$/) {
+                  w = tk[i]
+                  nh++
+                  hdstrip[nh] = (w ~ /^<<-/)
+                  sub(/^<<-?/, "", w)
+                  gsub(/["']/, "", w)
+                  hdword[nh] = w
+                }
+              }
+            }
+          }
+          function flush(    k, t, q) {
+            if (np == 0) return
+            process()
+            if (mode == "rewrite") {
+              for (q = ne; q >= 1; q--) {
+                k = ek[q]
+                ph[k] = substr(ph[k], 1, eo[q] - 1) er[q] substr(ph[k], eo[q] + el[q])
+              }
+              for (k = 1; k <= np; k++) print ph[k]
+            }
+            np = 0
+            ne = 0
+            logical = ""
+            cont = 0
+          }
+          BEGIN {
+            esc = "\\"
+            indirective = 1
+            if (mode == "rewrite") {
+              while ((getline l < mapfile) > 0) {
+                p = index(l, "\t")
+                pin[substr(l, 1, p - 1)] = substr(l, p + 1)
+              }
+              close(mapfile)
+            }
+          }
+          {
+            line = $0
+            if (nh > 0) {
+              emit(line)
+              chk = line
+              if (hdstrip[1]) sub(/^\t+/, "", chk)
+              if (chk == hdword[1]) {
+                for (i = 1; i < nh; i++) { hdword[i] = hdword[i + 1]; hdstrip[i] = hdstrip[i + 1] }
+                nh--
+              }
+              next
+            }
+            if (indirective) {
+              if (line ~ /^[ \t]*#[ \t]*[A-Za-z]+[ \t]*=/) {
+                key = line
+                sub(/^[ \t]*#[ \t]*/, "", key)
+                val = key
+                sub(/[ \t]*=.*$/, "", key)
+                sub(/^[^=]*=[ \t]*/, "", val)
+                key = tolower(key)
+                if (key == "escape" && length(val) >= 1) esc = substr(val, 1, 1)
+                if (key == "syntax" && mode == "scan") print "lockbox: warning: # syntax= is ignored (no frontend image is used)" > "/dev/stderr"
+                emit(line)
+                next
+              }
+              indirective = 0
+            }
+            if (line ~ /^[ \t]*(#.*)?$/) {
+              if (np > 0) { np++; ph[np] = line; skipf[np] = 1 } else emit(line)
+              next
+            }
+            body = line
+            sub(/[ \t]+$/, "", body)
+            c = 0
+            if (substr(body, length(body), 1) == esc) { c = 1; body = substr(body, 1, length(body) - 1) }
+            np++
+            ph[np] = line
+            skipf[np] = 0
+            base[np] = length(logical)
+            blen[np] = length(body)
+            logical = logical body
+            if (!c) {
+              flush()
+              if (failed) exit 1
+            } else cont = 1
+          }
+          END {
+            if (failed) exit 1
+            if (np > 0) flush()
+          }
+          AWK
+
+          awk -v mode=scan -f "$tmp/resolve.awk" "$LOCKBOX_CONTAINERFILE" >"$tmp/refs.raw" || fail "could not parse $LOCKBOX_CONTAINERFILE"
+          sort -u "$tmp/refs.raw" >"$tmp/refs"
+
+          : >"$tmp/map"
+          : >"$tmp/materials"
+          while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            case $ref in
+              *@sha256:*)
+                # A pin wins over a tag: the digest must exist, the tag is dropped.
+                want=${ref##*@sha256:}
+                matches '^[0-9a-f]{64}$' "$want" || fail "malformed digest in $ref"
+                repo=${ref%@sha256:*}
+                last=${repo##*/}
+                case $last in *:*) repo=${repo%:*} ;; esac
+                got=$(crane digest "$repo@sha256:$want" 2>"$tmp/err") || fail "cannot resolve $ref: $(head -n 1 "$tmp/err")"
+                [ "$got" = "sha256:$want" ] || fail "cannot resolve $ref: the registry returned $got"
+                hex=$want
+                pinned="$repo@sha256:$hex"
+                purl="pkg:docker/$repo@sha256:$hex"
+                ;;
+              *)
+                last=${ref##*/}
+                case $last in
+                  *:*)
+                    tag=${last##*:}
+                    repo=${ref%:*}
+                    ;;
+                  *)
+                    tag=latest
+                    repo=$ref
+                    ;;
+                esac
+                got=$(crane digest "$ref" 2>"$tmp/err") || fail "cannot resolve $ref: $(head -n 1 "$tmp/err")"
+                matches '^sha256:[0-9a-f]{64}$' "$got" || fail "cannot resolve $ref: the registry returned a malformed digest"
+                hex=${got#sha256:}
+                pinned="$repo@$got"
+                purl="pkg:docker/$repo@$tag"
+                ;;
+            esac
+            printf '%s\t%s\n' "$ref" "$pinned" >>"$tmp/map"
+            printf '%s %s\n' "$purl" "$hex" >>"$tmp/materials"
+          done <"$tmp/refs"
+
+          awk -v mode=rewrite -v mapfile="$tmp/map" -f "$tmp/resolve.awk" "$LOCKBOX_CONTAINERFILE" >"$tmp/pinned" || fail "could not rewrite $LOCKBOX_CONTAINERFILE"
+          sort -u "$tmp/materials" >"$LOCKBOX_WORK/materials.txt"
+          sha256_of "$tmp/pinned" >"$LOCKBOX_WORK/containerfile.sha256"
+          cat "$tmp/pinned" >"$LOCKBOX_WORK/Containerfile.pinned"
+          echo "lockbox: pinned $(wc -l <"$LOCKBOX_WORK/materials.txt" | tr -d ' ') external image reference(s)"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/build.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # build.sh: build the pinned Containerfile copy written by resolve.sh in the
+          # customer's CI (ci-templates.md section 3.3). Lockbox never builds: this runs in
+          # the customer's pipeline.
+          #   LOCKBOX_BUILDER=kaniko  (GitLab) no daemon; the OCI layout lands in
+          #                           $LOCKBOX_WORK/oci and push.sh pushes it to staging.
+          #   LOCKBOX_BUILDER=buildx  (GitHub, default) pushes to the STAGING tag directly,
+          #                           with --provenance=false --sbom=false.
+          # Multi-platform (LOCKBOX_PLATFORMS, v2.4.0): kaniko builds the platform of its slot
+          # (LOCKBOX_SLOT; layout oci-<slot> and built-digest-<slot> for slots above 1); buildx
+          # passes the whole list to --platform and pushes an index.
+          # The pinned copy is staged OUTSIDE the build context and the Lockbox work files
+          # are removed before the build, so none of them can enter the image (COPY . .).
+          set -eu
+          here=$(dirname "$0")
+          . "$here/env.sh"
+
+          [ -f "$LOCKBOX_WORK/Containerfile.pinned" ] || fail "no pinned Containerfile (resolve.sh did not run)"
+          ctx_abs() { # the context directory as an absolute path
+            case $LOCKBOX_CONTEXT in
+              /*) printf '%s' "$LOCKBOX_CONTEXT" ;;
+              .) printf '%s' "${CI_PROJECT_DIR:-$PWD}" ;;
+              *) printf '%s/%s' "${CI_PROJECT_DIR:-$PWD}" "$LOCKBOX_CONTEXT" ;;
+            esac
+          }
+
+          case $LOCKBOX_BUILDER in
+            kaniko)
+              # Multi-platform (v2.4.0): one build job per platform, selected by LOCKBOX_SLOT.
+              [ "$LOCKBOX_MULTI" != true ] || [ -n "${LOCKBOX_SLOT:-}" ] || fail "a multi-platform kaniko build needs LOCKBOX_SLOT (one build job per platform)"
+              [ -n "${CI_BUILDS_DIR:-}" ] || fail "CI_BUILDS_DIR is required (the staging directory must live outside the project)"
+              [ -n "${CI_JOB_ID:-}" ] || fail "CI_JOB_ID is required"
+              project=${CI_PROJECT_DIR:-$PWD}
+              ctx=$(ctx_abs)
+              stage="$CI_BUILDS_DIR/lockbox-$CI_JOB_ID"
+              # Not /tmp: kaniko replaces the container's root filesystem with the base
+              # image's, so anything under /tmp is gone after the build. The builds directory
+              # is a runner volume and the executor is told to ignore the stage directory.
+              case "$stage/" in "$ctx"/*) fail "the staging directory must be outside the build context" ;; esac
+              executor=/kaniko/executor
+              if [ -n "${LOCKBOX_HARNESS:-}" ] && [ -n "${LOCKBOX_KANIKO_EXECUTOR:-}" ]; then executor=$LOCKBOX_KANIKO_EXECUTOR; fi
+              mkdir -p "$stage"
+              cp "$LOCKBOX_WORK/Containerfile.pinned" "$stage/"
+              # kaniko may replace the filesystem, including the busybox that provides
+              # mv, grep and rm: keep one copy next to the stage directory for the steps after the build.
+              bb=""
+              if command -v busybox >/dev/null 2>&1; then
+                cp "$(command -v busybox)" "$stage/busybox"
+                bb="$stage/busybox"
+              fi
+              post() { if [ -n "$bb" ]; then "$bb" "$@"; else "$@"; fi; }
+
+              # Context hygiene: no Lockbox work file can enter the image.
+              rm -rf "$LOCKBOX_WORK" "$LOCKBOX_DIR"
+
+              # Environment scrub (best effort): kaniko runs RUN steps in this container, so they
+              # can read its environment. DOCKER_CONFIG is kept: it names the read-only pull
+              # credentials. A scrubbed GitLab file-type variable also has its file deleted (the
+              # runner writes those under "<project dir>.tmp/"). The scrub cannot protect a
+              # variable whose name it does not match: scope secrets to the signing environment.
+              for v in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+                case $v in DOCKER_CONFIG | PWD | OLDPWD) continue ;; esac
+                if printf '%s' "$v" | grep -Eiq '(TOKEN|PASS|SECRET|PRIVATE|_KEY|_AUTH|CREDENTIAL|PWD|JWT|KUBECONFIG|DSN)' || [ "$v" = CI_REPOSITORY_URL ]; then
+                  val=""
+                  eval "val=\${$v:-}"
+                  case $val in "$project".tmp/*) [ ! -f "$val" ] || rm -f "$val" ;; esac
+                  unset "$v" || true
+                fi
+              done
+              # The runner may leave the job token in the clone URL of .git/config.
+              if [ -f "$project/.git/config" ] && grep -q 'gitlab-ci-token:' "$project/.git/config"; then
+                sed 's#//gitlab-ci-token:[^@]*@#//#' "$project/.git/config" >"$stage/gitconfig.clean"
+                cat "$stage/gitconfig.clean" >"$project/.git/config"
+                rm -f "$stage/gitconfig.clean"
+              fi
+
+              set -- --context "$ctx" --dockerfile "$stage/Containerfile.pinned" --ignore-path "$stage" --image-format oci --no-push --destination lockbox-build:local --oci-layout-path "$stage/oci"
+              [ -z "${LOCKBOX_PLATFORM:-}" ] || set -- "$@" --custom-platform "$LOCKBOX_PLATFORM"
+              "$executor" "$@"
+
+              [ -f "$stage/oci/index.json" ] || fail "kaniko produced no OCI layout"
+              post mkdir -p "$LOCKBOX_WORK"
+              post mv "$stage/oci" "$LOCKBOX_WORK/oci$LOCKBOX_SLOT_SUFFIX"
+              n=$(post grep -Eo '"digest" *: *"sha256:[0-9a-f]{64}"' "$LOCKBOX_WORK/oci$LOCKBOX_SLOT_SUFFIX/index.json" | post wc -l | post tr -d ' ')
+              [ "$n" = 1 ] || fail "OCI layout must contain exactly one image"
+              built=$(post grep -Eo '"digest" *: *"sha256:[0-9a-f]{64}"' "$LOCKBOX_WORK/oci$LOCKBOX_SLOT_SUFFIX/index.json" | post grep -Eo 'sha256:[0-9a-f]{64}')
+              printf '%s\n' "$built" >"$LOCKBOX_WORK/built-digest$LOCKBOX_SLOT_SUFFIX"
+              post rm -rf "$stage"
+              echo "lockbox: built $built (OCI layout in $LOCKBOX_WORK/oci$LOCKBOX_SLOT_SUFFIX)"
+              ;;
+            buildx)
+              [ -n "${LOCKBOX_BUILDKIT_IMAGE:-}" ] || fail "LOCKBOX_BUILDKIT_IMAGE (pinned by digest) is required"
+              matches '@sha256:[0-9a-f]{64}$' "$LOCKBOX_BUILDKIT_IMAGE" || fail "the BuildKit image must be pinned by digest"
+              stage="${RUNNER_TEMP:?RUNNER_TEMP is required}/lockbox-build"
+              rm -rf "$stage"
+              mkdir -p "$stage"
+              cp "$LOCKBOX_WORK/Containerfile.pinned" "$LOCKBOX_WORK/materials.txt" "$LOCKBOX_WORK/containerfile.sha256" "$stage/"
+              rm -rf "$LOCKBOX_WORK" "$LOCKBOX_DIR"
+
+              builder=lockbox-builder
+              docker buildx rm "$builder" >/dev/null 2>&1 || true
+              docker buildx create --name "$builder" --driver docker-container --driver-opt "image=$LOCKBOX_BUILDKIT_IMAGE" >/dev/null
+              trap 'docker buildx rm "$builder" >/dev/null 2>&1 || true' EXIT
+
+              set -- --builder "$builder" --file "$stage/Containerfile.pinned" --provenance=false --sbom=false --push --tag "$LOCKBOX_STAGING_REF"
+              [ -z "${LOCKBOX_PLATFORM:-}" ] || set -- "$@" --platform "$LOCKBOX_PLATFORM"
+              docker buildx build "$@" "$LOCKBOX_CONTEXT"
+
+              mkdir -p "$LOCKBOX_WORK"
+              cp "$stage/materials.txt" "$stage/containerfile.sha256" "$LOCKBOX_WORK/"
+              rm -rf "$stage"
+              ;;
+            *) fail "builder must be kaniko or buildx" ;;
+          esac
+          LOCKBOX_EOF
+          # END lockbox-scripts
+
+      - name: Install Lockbox scripts (part 2 of 2) and validate inputs
+        run: |
+          # BEGIN lockbox-scripts digest scan result vuln attest gate promote provenance sign run-in
+          mkdir -p "$LOCKBOX_SCRIPTS"
+          cat >"$LOCKBOX_SCRIPTS/digest.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # digest.sh: the bound digest D (ci-templates.md section 3.5).
+          # What the REGISTRY serves for the staging tag. Never the local image ID.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          resolve_staging_digest
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/scan.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # scan.sh: Trivy by DIGEST from the registry (design section 2 step 4): the
+          # staging repository. Pulls
+          # <repo>@D from the registry (not a tag, not a local tarball), scanners
+          # vuln,secret. Writes lockbox/trivy.json and lockbox/sbom.cdx.json, plus work
+          # files for result.sh. The gate run uses --exit-code 1; its exit status is
+          # recorded and enforced by gate.sh after the result is written. Registry
+          # credentials come from DOCKER_CONFIG only (never TRIVY_USERNAME/PASSWORD, which
+          # would apply to every host).
+          #
+          # Trivy's own configuration is neutralised (review T2.17 H1): a committed
+          # .trivyignore, .trivyignore.yaml, trivy.yaml or trivy-secret.yaml, or a
+          # TRIVY_* variable (TRIVY_SEVERITY, TRIVY_IGNOREFILE, TRIVY_IGNORE_UNFIXED,
+          # TRIVY_SERVER, TRIVY_DB_REPOSITORY, TRIVY_CACHE_DIR, ...), could otherwise drop
+          # findings from every output Lockbox trusts. So every TRIVY_* variable is
+          # unset, Trivy runs from a fresh empty directory with an empty config and
+          # ignore file and a fresh cache, and every report run names its severities.
+          # PAT-7 (T3.18, scan-trust.md section 12): the gate ignores findings that have no
+          # fixed version. That is hard-coded on the one gate run (--ignore-unfixed) and
+          # nowhere else, so trivy.json, the SBOM and the findings list still carry every
+          # finding; TRIVY_IGNORE_UNFIXED stays unset with the rest of TRIVY_*.
+          # Client/server mode is never used (no --server, TRIVY_SERVER unset).
+          #
+          # Offline customers point Trivy at a vulnerability database mirror (and a
+          # Java database mirror) with LOCKBOX_TRIVY_DB_REPOSITORY and
+          # LOCKBOX_TRIVY_JAVA_DB_REPOSITORY (T2.17b, owner decision 2026-10-05). The
+          # templates set them from template inputs written in the committed CI
+          # configuration (GitLab spec:inputs interpolated into the job script, GitHub
+          # workflow_call inputs), never from a CI variable; Lockbox's trust check (T3)
+          # sees them there and in result.json and accepts only mirrors its policy
+          # lists. Empty means Trivy's default. They are written to the work directory
+          # for result.sh.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          db_repo=${LOCKBOX_TRIVY_DB_REPOSITORY:-}
+          java_db_repo=${LOCKBOX_TRIVY_JAVA_DB_REPOSITORY:-}
+          for m in "$db_repo" "$java_db_repo"; do
+            [ -z "$m" ] || valid_mirror "$m" || fail "trivy-db-repository and trivy-java-db-repository must be OCI references with an explicit registry host (host[:port]/path[:tag][@sha256:...])"
+          done
+
+          # Multi-platform (v2.4.0): scan every platform manifest of the staging index by its own
+          # digest, each in its own context (lockbox/<slug>/, .lockbox-work/p/<slug>/). Nothing from
+          # the checkout may stand in for a scan output.
+          if multi_parent; then
+            rm -rf "$LOCKBOX_DIR"
+            mkdir -p "$LOCKBOX_DIR" "$LOCKBOX_WORK"
+            run_each "$0"
+            exit 0
+          fi
+
+          for v in $(env | sed -n 's/^\(TRIVY_[A-Za-z0-9_]*\)=.*/\1/p'); do
+            unset "$v"
+          done
+          unset LD_PRELOAD LD_LIBRARY_PATH
+
+          d=$(digest_of)
+          ref="$LOCKBOX_STAGING_IMAGE@$d"
+          platform=${LOCKBOX_PLATFORM:-}
+          # Nothing from the checkout may stand in for a scan output.
+          rm -rf "$LOCKBOX_DIR"
+          mkdir -p "$LOCKBOX_DIR" "$LOCKBOX_WORK"
+          # Absolute paths: Trivy runs from another directory.
+          out=$(cd "$LOCKBOX_DIR" && pwd)
+          work=$(cd "$LOCKBOX_WORK" && pwd)
+          if [ -n "${DOCKER_CONFIG:-}" ]; then
+            case $DOCKER_CONFIG in /*) ;; *) DOCKER_CONFIG="$PWD/$DOCKER_CONFIG" ;; esac
+            export DOCKER_CONFIG
+          fi
+          run=$(mktemp -d "${TMPDIR:-/tmp}/lockbox-trivy.XXXXXX")
+          trap 'rm -rf "$run"' EXIT
+          mkdir "$run/cwd" "$run/cache"
+          : >"$run/trivy.yaml"
+          : >"$run/trivyignore"
+          cd "$run/cwd"
+          date -u +%Y-%m-%dT%H:%M:%SZ >"$work/scan-started"
+          printf '%s\n' "$db_repo" >"$work/db-repository"
+          printf '%s\n' "$java_db_repo" >"$work/java-db-repository"
+
+          all=UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+          # Common arguments: registry source only, optional platform for an index.
+          set -- image --image-src remote --no-progress --quiet --cache-dir "$run/cache" --config "$run/trivy.yaml" --ignorefile "$run/trivyignore"
+          [ -z "$platform" ] || set -- "$@" --platform "$platform"
+          [ -z "$db_repo" ] || set -- "$@" --db-repository "$db_repo"
+          [ -z "$java_db_repo" ] || set -- "$@" --java-db-repository "$java_db_repo"
+
+          trivy "$@" --scanners vuln,secret --severity "$all" --format json --output "$out/trivy.json" "$ref"
+          # The database is now cached: the remaining runs use the same one.
+          trivy "$@" --skip-db-update --severity "$all" --format cyclonedx --output "$out/sbom.cdx.json" "$ref"
+
+          # One line per finding ("V <severity> fixed|unfixed" or "S <severity>"), counted by
+          # result.sh. "fixed" means FixedVersion is non-empty, the one definition Lockbox uses.
+          printf '%s\n' '{{ range . }}{{ range .Vulnerabilities }}V {{ .Severity }} {{ if .FixedVersion }}fixed{{ else }}unfixed{{ end }}{{ "\n" }}{{ end }}{{ range .Secrets }}S {{ .Severity }}{{ "\n" }}{{ end }}{{ end }}' >"$work/findings.tpl"
+          trivy "$@" --skip-db-update --scanners vuln,secret --severity "$all" --format template --template "@$work/findings.tpl" --output "$work/findings.txt" "$ref"
+
+          trivy --version --cache-dir "$run/cache" >"$work/trivy-version.txt"
+
+          rc=0
+          trivy "$@" --skip-db-update --scanners vuln,secret --severity "$LOCKBOX_SEVERITY" --ignore-unfixed --exit-code 1 "$ref" || rc=$?
+          printf '%s\n' "$rc" >"$work/gate-rc"
+          date -u +%Y-%m-%dT%H:%M:%SZ >"$work/scan-finished"
+          echo "lockbox: trivy gate exit status $rc"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/result.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # result.sh: write lockbox/result.json (design section 3) for pass and fail,
+          # and $LOCKBOX_WORK/passed. passed is true only when the Trivy gate exited 0,
+          # no FIXED finding at a gate severity exists and no secret exists (PAT-7, T3.18:
+          # findings without a fixed version are listed and counted but never gate). Lockbox recomputes
+          # all of this from trivy.json (against the union of severity_gate and its own
+          # floor) and trusts only "digest" from this file. Schema 1 with the additive v2
+          # fields mode, scan_ref, reason, template_version, platform (ci-templates.md
+          # section 7), and scanner.db_repository / scanner.java_db_repository (T2.17b).
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          # Multi-platform (v2.4.0): one result.json per platform (lockbox/<slug>/result.json, its
+          # digest the platform manifest digest, index_digest the staging index). The aggregate
+          # $LOCKBOX_WORK/passed is true only when EVERY platform passed. When one fails, the other
+          # platforms' results are written again with an empty release_ref: nothing is promoted.
+          if multi_parent; then
+            run_each "$0"
+            all=true
+            gated_total=0
+            while read -r slug _; do
+              [ -n "$slug" ] || continue
+              [ "$(cat "$LOCKBOX_WORK/p/$slug/passed" 2>/dev/null || echo false)" = true ] || all=false
+              gated_total=$((gated_total + $(cat "$LOCKBOX_WORK/p/$slug/gated" 2>/dev/null || echo 0)))
+            done <"$LOCKBOX_WORK/platform-digests"
+            if [ "$all" != true ]; then
+              while read -r slug _; do
+                [ -n "$slug" ] || continue
+                [ "$(cat "$LOCKBOX_WORK/p/$slug/passed")" = true ] || continue
+                LOCKBOX_HOLD_RELEASE=true LOCKBOX_SLUG=$slug sh "$0" </dev/null || exit 1
+              done <"$LOCKBOX_WORK/platform-digests"
+            fi
+            printf '%s\n' "$all" >"$LOCKBOX_WORK/passed"
+            printf '%s\n' "$gated_total" >"$LOCKBOX_WORK/gated"
+            echo "lockbox: platform results written (all platforms passed=$all)"
+            exit 0
+          fi
+
+          d=$(digest_of)
+          for f in "$LOCKBOX_DIR/trivy.json" "$LOCKBOX_WORK/findings.txt" "$LOCKBOX_WORK/gate-rc" "$LOCKBOX_WORK/trivy-version.txt" "$LOCKBOX_WORK/db-repository" "$LOCKBOX_WORK/java-db-repository"; do
+            [ -e "$f" ] || fail "missing scan output $f"
+          done
+          rc=$(cat "$LOCKBOX_WORK/gate-rc")
+          matches '^[0-9]+$' "$rc" || fail "malformed gate status"
+
+          count() {
+            grep -c "^$1 $2 " "$LOCKBOX_WORK/findings.txt" || true
+          }
+          count_fixed() {
+            grep -c "^V $1 fixed\$" "$LOCKBOX_WORK/findings.txt" || true
+          }
+
+          critical=$(count V CRITICAL)
+          high=$(count V HIGH)
+          medium=$(count V MEDIUM)
+          low=$(count V LOW)
+          unknown=$(count V UNKNOWN)
+          secrets=$(grep -c '^S ' "$LOCKBOX_WORK/findings.txt" || true)
+
+          gated=0
+          oldifs=$IFS
+          IFS=,
+          for sev in $LOCKBOX_SEVERITY; do
+            n=$(count_fixed "$sev")
+            gated=$((gated + n))
+          done
+          IFS=$oldifs
+
+          passed=false
+          if [ "$rc" -eq 0 ] && [ "$gated" -eq 0 ] && [ "$secrets" -eq 0 ]; then
+            passed=true
+          fi
+          release_ref=""
+          staging_ref=""
+          scan_ref=""
+          platform=${LOCKBOX_PLATFORM:-}
+          containerfile=$LOCKBOX_CONTAINERFILE
+          context=$LOCKBOX_CONTEXT
+          staging_ref="$LOCKBOX_STAGING_IMAGE@$d"
+          # A merge request pipeline never produces a release reference (T5.16).
+          [ "$passed" = true ] && [ "$LOCKBOX_MR" != true ] && [ "${LOCKBOX_HOLD_RELEASE:-}" != true ] && release_ref=$LOCKBOX_RELEASE_REF
+          # Multi-platform: the staging index every per-platform result belongs to (additive field).
+          index_json=""
+          [ -z "$LOCKBOX_INDEX_DIGEST" ] || index_json=$(printf ',\n  "index_digest": "%s"' "$(esc "$LOCKBOX_INDEX_DIGEST")")
+
+          # mode "mr" and the "mr" object (additive, schema 1; validation-build.md section 7.1).
+          # Absent in every other result. The values are provider facts, copied verbatim.
+          result_mode=$LOCKBOX_MODE
+          mr_json=""
+          if [ "$LOCKBOX_MR" = true ]; then
+            result_mode=mr
+            for n in "${LOCKBOX_MR_IID:-}" "${LOCKBOX_MR_PROJECT_ID:-0}" "${LOCKBOX_MR_SOURCE_PROJECT_ID:-0}"; do
+              matches '^[0-9]+$' "$n" || fail "malformed merge request number"
+            done
+            if [ "${LOCKBOX_PROVIDER:-}" = github ]; then
+              mr_json=$(printf ',\n  "mr": {"number": %s, "head_repo": "%s", "head_sha": "%s", "base_ref": "%s"}' \
+                "$(esc "${LOCKBOX_MR_IID:-}")" "$(esc "${LOCKBOX_MR_HEAD_REPO:-}")" "$(esc "${LOCKBOX_MR_HEAD_SHA:-}")" "$(esc "${LOCKBOX_MR_TARGET_BRANCH:-}")")
+            else
+              mr_json=$(printf ',\n  "mr": {"iid": %s, "project_id": %s, "source_project_id": %s, "source_branch": "%s", "target_branch": "%s", "head_sha": "%s", "event_type": "%s"}' \
+                "$(esc "${LOCKBOX_MR_IID:-}")" "$(esc "${LOCKBOX_MR_PROJECT_ID:-}")" "$(esc "${LOCKBOX_MR_SOURCE_PROJECT_ID:-}")" "$(esc "${LOCKBOX_MR_SOURCE_BRANCH:-}")" \
+                "$(esc "${LOCKBOX_MR_TARGET_BRANCH:-}")" "$(esc "${LOCKBOX_MR_HEAD_SHA:-}")" "$(esc "${LOCKBOX_MR_EVENT_TYPE:-}")")
+            fi
+          fi
+
+          # Images mode (template v2.5.0, ci-templates.md section 2.4): what lockbox:images resolved, additive
+          # and only in images mode. Lockbox ignores it (schema 1 readers skip unknown fields); it is evidence
+          # for the customer's auditors and for the next reader of the run.
+          images_json=""
+          if [ -n "${LOCKBOX_IMAGES_DIR:-}" ]; then
+            images_json=$(printf ',\n  "images": {"dir": "%s", "name": "%s", "how": "%s", "context": "%s", "containerfile": "%s", "release": "%s", "staging": "%s", "severity": "%s", "tag_scheme": "%s"}' \
+              "$(esc "$LOCKBOX_IMAGES_DIR")" "$(esc "${LOCKBOX_IMAGE_NAME:-}")" "$(esc "${LOCKBOX_IMAGES_HOW:-}")" "$(esc "$LOCKBOX_CONTEXT")" "$(esc "$LOCKBOX_CONTAINERFILE")" \
+              "$(esc "$LOCKBOX_IMAGE")" "$(esc "$LOCKBOX_STAGING_IMAGE")" "$(esc "$LOCKBOX_SEVERITY")" "$(esc "${LOCKBOX_TAG_SCHEME:-}")")
+          fi
+
+          # The database mirrors scan.sh used (T2.17b): Lockbox's T3 accepts only the
+          # mirrors its policy lists for the template (empty: Trivy's default).
+          db_repo=$(head -n 1 "$LOCKBOX_WORK/db-repository")
+          java_db_repo=$(head -n 1 "$LOCKBOX_WORK/java-db-repository")
+          for m in "$db_repo" "$java_db_repo"; do
+            [ -z "$m" ] || valid_mirror "$m" || fail "malformed trivy database mirror record"
+          done
+          version=$(sed -n 's/^Version: *//p' "$LOCKBOX_WORK/trivy-version.txt" | head -n 1)
+          db_updated=$(awk '/Vulnerability DB:/ { f = 1 } f && /UpdatedAt:/ { print $2 "T" substr($3, 1, 8) "Z"; exit }' "$LOCKBOX_WORK/trivy-version.txt")
+
+          cat >"$LOCKBOX_DIR/result.json" <<EOF
+          {
+            "schema": 1,
+            "digest": "$(esc "$d")",
+            "staging_ref": "$(esc "$staging_ref")",
+            "release_ref": "$(esc "$release_ref")",
+            "passed": $passed,
+            "severity_gate": "$(esc "$LOCKBOX_SEVERITY")",
+            "counts": {"CRITICAL": $critical, "HIGH": $high, "MEDIUM": $medium, "LOW": $low, "UNKNOWN": $unknown},
+            "secrets": $secrets,
+            "scanner": {"name": "trivy", "version": "$(esc "$version")", "image": "$(esc "$LOCKBOX_TRIVY_IMAGE")", "db_updated_at": "$(esc "$db_updated")", "db_repository": "$(esc "$db_repo")", "java_db_repository": "$(esc "$java_db_repo")"},
+            "lockbox_run_id": "$(esc "${LOCKBOX_RUN_ID:-}")",
+            "provider": "$(esc "${LOCKBOX_PROVIDER:-}")",
+            "run_id": "$(esc "$LOCKBOX_CI_RUN_ID")",
+            "run_attempt": "$(esc "$LOCKBOX_CI_RUN_ATTEMPT")",
+            "commit_sha": "$(esc "$LOCKBOX_COMMIT_SHA")",
+            "ref": "$(esc "${LOCKBOX_REF:-}")",
+            "template_ref": "$(esc "${LOCKBOX_TEMPLATE_REF:-}")",
+            "scanned_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "mode": "$(esc "$result_mode")",
+            "scan_ref": "$(esc "$scan_ref")",
+            "reason": "$(esc "${LOCKBOX_REASON:-}")",
+            "template_version": "2",
+            "platform": "$(esc "$platform")",
+            "gate_ignores_unfixed": true,
+            "containerfile": "$(esc "$containerfile")",
+            "context": "$(esc "$context")"$index_json$mr_json$images_json
+          }
+          EOF
+          printf '%s\n' "$passed" >"$LOCKBOX_WORK/passed"
+          printf '%s\n' "$gated" >"$LOCKBOX_WORK/gated"
+          echo "lockbox: result.json written (passed=$passed, gated (fixed) findings=$gated, secrets=$secrets)"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/vuln.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # vuln.sh: write the in-toto v1 statement of the signed vulnerability
+          # attestation (ci-templates.md section 6.1) to $LOCKBOX_ATTEST_DIR/vuln-statement.json.
+          # Predicate type: cosign's vuln (https://cosign.sigstore.dev/attestation/vuln/v1),
+          # with Lockbox's binding data in scanner.result.lockbox: the sha256 of
+          # result.json, trivy.json and sbom.cdx.json and a verbatim copy of result.json.
+          # The subject is the repository (no tag, no digest) of the staging ref, with
+          # the bound digest D.
+          # The predicate is written first to $LOCKBOX_ATTEST_DIR/vuln-predicate.json and the
+          # statement is built from that file; sign.sh attaches the same predicate file
+          # to the release digest (A2), because cosign attest builds its own statement.
+          # The inputs (lockbox/, .lockbox-work/) are only read: on GitLab they belong to
+          # the scan job's uid, and this job (cosign image) runs as another one (T2.11c).
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          # Multi-platform (v2.4.0): one statement per platform manifest, in lockbox-attest/<slug>/.
+          if multi_parent; then
+            fresh_dir "$LOCKBOX_ATTEST_DIR"
+            run_each "$0"
+            exit 0
+          fi
+
+          d=$(digest_of)
+          hex=${d#sha256:}
+          result="$LOCKBOX_DIR/result.json"
+          trivy_json="$LOCKBOX_DIR/trivy.json"
+          sbom="$LOCKBOX_DIR/sbom.cdx.json"
+          for f in "$result" "$trivy_json" "$sbom" "$LOCKBOX_WORK/trivy-version.txt" "$LOCKBOX_WORK/scan-started" "$LOCKBOX_WORK/scan-finished"; do
+            [ -s "$f" ] || fail "missing input for the vulnerability statement: $f"
+          done
+          repo=$LOCKBOX_STAGING_IMAGE
+          matches '^[a-z0-9][a-z0-9.-]*(:[0-9]+)?(/[a-z0-9][a-z0-9._-]*)+$' "$repo" || fail "malformed subject repository"
+
+          fresh_dir "$LOCKBOX_ATTEST_DIR"
+          version=$(sed -n 's/^Version: *//p' "$LOCKBOX_WORK/trivy-version.txt" | head -n 1)
+          db_updated=$(awk '/Vulnerability DB:/ { f = 1 } f && /UpdatedAt:/ { print $2 "T" substr($3, 1, 8) "Z"; exit }' "$LOCKBOX_WORK/trivy-version.txt")
+
+          cat >"$LOCKBOX_ATTEST_DIR/vuln-predicate.json" <<EOF
+          {
+            "invocation": {
+              "parameters": null,
+              "uri": "$(esc "${LOCKBOX_RUN_URL:-}")",
+              "event_id": "$(esc "$LOCKBOX_CI_RUN_ID")",
+              "builder.id": "$(esc "${LOCKBOX_BUILDER_ID:-}")"
+            },
+            "scanner": {
+              "uri": "$(esc "$LOCKBOX_TRIVY_IMAGE")",
+              "version": "$(esc "$version")",
+              "db": {"uri": "", "version": "$(esc "$db_updated")"},
+              "result": {
+                "lockbox": {
+                  "schema": 1,
+                  "files": {
+                    "result.json": {"sha256": "$(sha256_of "$result")"},
+                    "trivy.json": {"sha256": "$(sha256_of "$trivy_json")"},
+                    "sbom.cdx.json": {"sha256": "$(sha256_of "$sbom")"}
+                  },
+                  "result": $(cat "$result")
+                }
+              }
+            },
+            "metadata": {"scanStartedOn": "$(esc "$(cat "$LOCKBOX_WORK/scan-started")")", "scanFinishedOn": "$(esc "$(cat "$LOCKBOX_WORK/scan-finished")")"}
+          }
+          EOF
+          cat >"$LOCKBOX_ATTEST_DIR/vuln-statement.json" <<EOF
+          {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "$(esc "$repo")", "digest": {"sha256": "$hex"}}],
+            "predicateType": "https://cosign.sigstore.dev/attestation/vuln/v1",
+            "predicate": $(cat "$LOCKBOX_ATTEST_DIR/vuln-predicate.json")
+          }
+          EOF
+          echo "lockbox: vulnerability statement written for $repo@$d"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/attest.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # attest.sh: sign the vulnerability statement and write the sigstore bundle to
+          # $LOCKBOX_ATTEST_DIR/vuln.sigstore.json (A1, ci-templates.md section 6.2). Produced for
+          # passing and failing scans and in both modes; never pushed to a registry.
+          #   LOCKBOX_SIGNING=keyless  OIDC identity from the CI platform (GitLab: SIGSTORE_ID_TOKEN
+          #                            from id_tokens; GitHub: ambient OIDC)
+          #   LOCKBOX_SIGNING=key      LOCKBOX_COSIGN_KEY (KMS URI, env://VAR, key file);
+          #                            LOCKBOX_TLOG_UPLOAD=false for offline use
+          #   LOCKBOX_SIGNING=none     nothing is signed
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          if [ "$LOCKBOX_SIGNING" = none ]; then
+            echo "lockbox: signing disabled (signing: none); no vulnerability attestation"
+            exit 0
+          fi
+          if multi_parent; then # one bundle per platform (v2.4.0): lockbox-attest/<slug>/vuln.sigstore.json
+            run_each "$0"
+            exit 0
+          fi
+          [ -s "$LOCKBOX_ATTEST_DIR/vuln-statement.json" ] || fail "no vulnerability statement (run vuln.sh first)"
+
+          set -- --yes
+          if [ "$LOCKBOX_SIGNING" = key ]; then
+            set -- "$@" --key "$LOCKBOX_COSIGN_KEY"
+            [ "$LOCKBOX_TLOG_UPLOAD" = true ] || set -- "$@" --use-signing-config=false --tlog-upload=false
+          fi
+          [ -w "$LOCKBOX_ATTEST_DIR" ] || fail "$LOCKBOX_ATTEST_DIR is not writable (run vuln.sh in this job first)"
+          # The blob argument is the statement file: with --statement cosign signs the
+          # statement as given, the blob only supplies a fallback subject.
+          cosign attest-blob "$@" --statement "$LOCKBOX_ATTEST_DIR/vuln-statement.json" --bundle "$LOCKBOX_ATTEST_DIR/vuln.sigstore.json" "$LOCKBOX_ATTEST_DIR/vuln-statement.json"
+          echo "lockbox: vulnerability attestation written to $LOCKBOX_ATTEST_DIR/vuln.sigstore.json"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/gate.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # gate.sh: fail the job when the scan did not pass. Runs after result.json is
+          # written and uploaded, and before anything is promoted or signed.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          if multi_parent; then
+            # Multi-platform (v2.4.0): the index is promoted only when EVERY platform passed.
+            [ -s "$LOCKBOX_WORK/platform-digests" ] || fail "no platform digests (the scan did not run)"
+            while read -r slug plat _; do
+              [ -n "$slug" ] || continue
+              [ "$(cat "$LOCKBOX_WORK/p/$slug/passed" 2>/dev/null || echo false)" = true ] || fail "scan gate failed for $plat: $(cat "$LOCKBOX_WORK/p/$slug/gated" 2>/dev/null || echo 0) fixed finding(s) at the gate severities or a secret; nothing is promoted to the release tag (see lockbox/$slug/trivy.json)"
+            done <"$LOCKBOX_WORK/platform-digests"
+          fi
+          [ "$(cat "$LOCKBOX_WORK/passed" 2>/dev/null || echo false)" = true ] || fail "scan gate failed: $(cat "$LOCKBOX_WORK/gated" 2>/dev/null || echo 0) fixed finding(s) at the gate severities or a secret; nothing is promoted to the release tag (see lockbox/trivy.json)"
+          echo "lockbox: scan gate passed"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/promote.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # promote.sh: on pass only, copy staging@D to image:<release tag> by digest
+          # (crane copy: no rebuild, no recompression), then re-check that the release
+          # tag serves D (design section 2 step 7). Fails closed.
+          #
+          # An existing release tag is never moved to another digest (review S14): when
+          # the tag already exists it must already serve D, except that the default
+          # commit-SHA tag (one tag per commit) may be re-pointed when a pipeline for the
+          # same commit is re-run. A custom release-tag that exists is refused.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          [ "$(cat "$LOCKBOX_WORK/passed" 2>/dev/null || echo false)" = true ] || fail "refusing to promote: the scan did not pass"
+          d=$(digest_of)
+          if [ "$LOCKBOX_MULTI" = true ]; then
+            # Multi-platform (v2.4.0): the index is promoted only when EVERY platform passed.
+            [ -s "$LOCKBOX_WORK/platform-digests" ] || fail "no platform digests (the scan did not run)"
+            while read -r slug plat _; do
+              [ -n "$slug" ] || continue
+              [ "$(cat "$LOCKBOX_WORK/p/$slug/passed" 2>/dev/null || echo false)" = true ] || fail "refusing to promote: the scan of $plat did not pass"
+            done <"$LOCKBOX_WORK/platform-digests"
+          fi
+
+          if existing=$(crane digest "$LOCKBOX_RELEASE_REF" 2>&1); then
+            if [ "$existing" = "$d" ]; then
+              echo "lockbox: $LOCKBOX_RELEASE_REF already serves $d"
+            elif [ "$LOCKBOX_RELEASE_TAG" = "${LOCKBOX_COMMIT_SHA:-}" ]; then
+              echo "lockbox: re-pointing the commit-SHA tag $LOCKBOX_RELEASE_REF from $existing to $d"
+            else
+              fail "refusing to overwrite the existing release tag $LOCKBOX_RELEASE_REF ($existing); use a new release-tag or the default commit-SHA tag"
+            fi
+          else
+            # Only a clearly "no such tag" answer lets the copy proceed; any other
+            # failure (auth, network) fails closed rather than risking an overwrite.
+            case $existing in
+              *MANIFEST_UNKNOWN* | *NAME_UNKNOWN* | *"not found"* | *"Not Found"* | *404*) ;;
+              *) fail "could not check whether $LOCKBOX_RELEASE_REF exists: $existing" ;;
+            esac
+          fi
+
+          crane copy "$LOCKBOX_STAGING_IMAGE@$d" "$LOCKBOX_RELEASE_REF"
+          got=$(crane digest "$LOCKBOX_RELEASE_REF")
+          [ "$got" = "$d" ] || fail "release digest mismatch: expected $d, the release tag serves $got"
+          if [ "$LOCKBOX_MULTI" = true ]; then
+            # Multi-platform (v2.4.0): crane copy of the index copies its platform manifests too;
+            # check that every platform digest the scan covered is now in the release repository.
+            while read -r slug plat pd; do
+              [ -n "$slug" ] || continue
+              got=$(crane digest "$LOCKBOX_IMAGE@$pd") || fail "platform $plat ($pd) is missing from the release repository"
+              [ "$got" = "$pd" ] || fail "release digest mismatch for $plat"
+            done <"$LOCKBOX_WORK/platform-digests"
+          fi
+          printf '%s\n' "$LOCKBOX_RELEASE_REF" >"$LOCKBOX_WORK/release-ref"
+          echo "lockbox: promoted $LOCKBOX_RELEASE_REF at $d"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/provenance.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # provenance.sh: build the SLSA provenance v1 predicate
+          # (https://slsa.dev/provenance/v1) that is signed in step 8 (design section 6).
+          # buildDefinition.resolvedDependencies lists the source commit and EVERY base
+          # image the build pulled, each as
+          #   {"uri": "pkg:docker/<repo>@<tag-or-digest>", "digest": {"sha256": "<hex>"}}
+          # taken from $LOCKBOX_WORK/materials.txt (resolve.sh: the refs pinned before the build).
+          # Extra environment: LOCKBOX_SOURCE_URI (repository URL), LOCKBOX_BUILDER_ID,
+          # LOCKBOX_RUN_URL, LOCKBOX_REF.
+          # Written to $LOCKBOX_SIGN_DIR/provenance.json, a directory this job creates:
+          # on GitLab it runs as the cosign image's non-root uid (T2.11c).
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          [ -f "$LOCKBOX_WORK_BASE/materials.txt" ] || fail "no base image record (materials.txt): the resolve step did not run"
+          [ -s "$LOCKBOX_WORK_BASE/containerfile.sha256" ] || fail "no pinned Containerfile hash (the resolve step did not run)"
+          pinned_sha=$(cat "$LOCKBOX_WORK_BASE/containerfile.sha256")
+          matches '^[0-9a-f]{64}$' "$pinned_sha" || fail "malformed pinned Containerfile hash"
+          [ -n "${LOCKBOX_SOURCE_URI:-}" ] || fail "LOCKBOX_SOURCE_URI is required"
+          [ -n "${LOCKBOX_BUILDER_ID:-}" ] || fail "LOCKBOX_BUILDER_ID is required"
+
+          deps="    {\"uri\": \"git+$(esc "$LOCKBOX_SOURCE_URI")@$(esc "${LOCKBOX_REF:-}")\", \"digest\": {\"gitCommit\": \"$(esc "$LOCKBOX_COMMIT_SHA")\"}}"
+          while read -r uri hex; do
+            [ -n "$uri" ] || continue
+            matches '^pkg:docker/[A-Za-z0-9._/@:%+-]+$' "$uri" || fail "malformed base image purl in materials.txt"
+            matches '^[0-9a-f]{64}$' "$hex" || fail "malformed base image digest in materials.txt"
+            deps="$deps,
+              {\"uri\": \"$(esc "$uri")\", \"digest\": {\"sha256\": \"$hex\"}}"
+          done <"$LOCKBOX_WORK_BASE/materials.txt"
+
+          fresh_dir "$LOCKBOX_SIGN_DIR"
+          cat >"$LOCKBOX_SIGN_DIR/provenance.json" <<EOF
+          {
+            "buildDefinition": {
+              "buildType": "urn:lockbox:build-type:customer-ci:v1",
+              "externalParameters": {
+                "source": "$(esc "$LOCKBOX_SOURCE_URI")",
+                "ref": "$(esc "${LOCKBOX_REF:-}")",
+                "containerfile": "$(esc "$LOCKBOX_CONTAINERFILE")",
+                "context": "$(esc "$LOCKBOX_CONTEXT")",
+                "platform": "$(esc "${LOCKBOX_PLATFORM:-}")",
+                "image": "$(esc "$LOCKBOX_IMAGE")",
+                "builder": "$(esc "$LOCKBOX_BUILDER")"
+              },
+              "internalParameters": {
+                "provider": "$(esc "${LOCKBOX_PROVIDER:-}")",
+                "lockbox_run_id": "$(esc "${LOCKBOX_RUN_ID:-}")",
+                "run_id": "$(esc "$LOCKBOX_CI_RUN_ID")",
+                "run_attempt": "$(esc "$LOCKBOX_CI_RUN_ATTEMPT")",
+                "template_ref": "$(esc "${LOCKBOX_TEMPLATE_REF:-}")",
+                "containerfile_pinned_sha256": "$(esc "$pinned_sha")",
+                "reason": "$(esc "${LOCKBOX_REASON:-}")"
+              },
+              "resolvedDependencies": [
+          $deps
+              ]
+            },
+            "runDetails": {
+              "builder": {"id": "$(esc "$LOCKBOX_BUILDER_ID")"},
+              "metadata": {
+                "invocationId": "$(esc "${LOCKBOX_RUN_URL:-}")",
+                "finishedOn": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              }
+            }
+          }
+          EOF
+          echo "lockbox: provenance predicate written"
+          # Multi-platform (v2.4.0): the predicate above is the index's (platform = the list); each
+          # platform also gets its own in .lockbox-sign/<slug>/ (the base images are shared).
+          if multi_parent; then run_each "$0"; fi
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/sign.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # sign.sh: sign the RELEASE digest and attach SLSA provenance with cosign
+          # (design section 6). Signatures and attestations are sigstore bundles stored
+          # as OCI 1.1 referrers (cosign v3), never legacy .sig/.att tags.
+          #   LOCKBOX_SIGNING=keyless  OIDC identity from the CI platform (Fulcio + Rekor)
+          #   LOCKBOX_SIGNING=key      LOCKBOX_COSIGN_KEY (KMS URI, env://VAR, key file);
+          #                            LOCKBOX_TLOG_UPLOAD=false for offline use
+          #   LOCKBOX_SIGNING=none     nothing is signed (Lockbox reports the image unverified)
+          #   LOCKBOX_ATTEST=cosign    (default) attest provenance here; "none" when the
+          #                            platform attests (GitHub keyless uses actions/attest)
+          # After the signature and the provenance, the signed vulnerability statement
+          # (vuln.sh) is attached to the release digest as well (A2).
+          # The password for an encrypted key comes from COSIGN_PASSWORD in the
+          # environment (a CI secret) and is never echoed.
+          set -eu
+          . "$(dirname "$0")/env.sh"
+
+          if [ "$LOCKBOX_SIGNING" = none ]; then
+            echo "lockbox: signing disabled (signing: none); Lockbox will report this image as unverified"
+            exit 0
+          fi
+          d=$(digest_of)
+          subject="$LOCKBOX_IMAGE@$d"
+
+          set -- --yes
+          if [ "$LOCKBOX_SIGNING" = key ]; then
+            set -- "$@" --key "$LOCKBOX_COSIGN_KEY"
+            [ "$LOCKBOX_TLOG_UPLOAD" = true ] || set -- "$@" --use-signing-config=false --tlog-upload=false
+          fi
+          # Test hook for plain-HTTP registries is a PATH shim (integrations/test), not an input.
+
+          cosign sign "$@" "$subject"
+          if [ "${LOCKBOX_ATTEST:-cosign}" = cosign ]; then
+            [ -s "$LOCKBOX_SIGN_DIR/provenance.json" ] || fail "no provenance predicate (run provenance.sh first)"
+            cosign attest "$@" --type slsaprovenance1 --predicate "$LOCKBOX_SIGN_DIR/provenance.json" "$subject"
+          fi
+
+          # A2 (ci-templates.md section 6.3): the vulnerability attestation as an OCI 1.1
+          # referrer of the release digest. cosign attest builds the statement itself
+          # (subject = the release repository and D), so it is given the predicate file
+          # that vuln.sh also embedded in the A1 statement.
+          #
+          # Multi-platform (v2.4.0): this run (no platform context) signs the INDEX digest and attaches
+          # its provenance; the vulnerability attestation is per platform, so it is attached by the
+          # per-platform runs below, each to its own platform manifest digest in the release repository.
+          if multi_parent; then
+            echo "lockbox: signed index $subject"
+            run_each "$0"
+            exit 0
+          fi
+          [ -s "$LOCKBOX_ATTEST_DIR/vuln-predicate.json" ] || fail "no vulnerability predicate (run vuln.sh first)"
+          cosign attest "$@" --type vuln --predicate "$LOCKBOX_ATTEST_DIR/vuln-predicate.json" "$subject"
+          echo "lockbox: signed $subject"
+          LOCKBOX_EOF
+          cat >"$LOCKBOX_SCRIPTS/run-in.sh" <<'LOCKBOX_EOF'
+          #!/bin/sh
+          # run-in.sh IMAGE SCRIPT: run one of these scripts inside a pinned tool image
+          # (GitHub template: crane and Trivy run from their pinned images through the
+          # runner's docker). The workspace is mounted at /w, the scripts at /s (read
+          # only), every LOCKBOX_* variable is passed by NAME (values never appear on a
+          # command line), and the registry credentials directory is mounted if set.
+          set -eu
+          [ $# -eq 2 ] || { echo "usage: run-in.sh IMAGE SCRIPT" >&2; exit 2; }
+          img=$1
+          script=$2
+
+          set -- docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/w" -w /w -v "$(dirname "$script"):/s:ro" -e LOCKBOX_SCRIPTS=/s
+          for v in $(env | sed -n 's/^\(LOCKBOX_[A-Za-z0-9_]*\)=.*/\1/p'); do
+            case $v in LOCKBOX_SCRIPTS) continue ;; esac
+            set -- "$@" -e "$v"
+          done
+          if [ -n "${DOCKER_CONFIG:-}" ] && [ -d "$DOCKER_CONFIG" ]; then
+            set -- "$@" -v "$DOCKER_CONFIG:/dc:ro" -e DOCKER_CONFIG=/dc
+          fi
+          exec "$@" --entrypoint sh "$img" "/s/$(basename "$script")"
+          LOCKBOX_EOF
+          # END lockbox-scripts
+          sh "$LOCKBOX_SCRIPTS/guard.sh"
+
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Committed files must not stand in for Lockbox outputs (review T2.17).
+      - name: Remove Lockbox output directories from the workspace
+        run: rm -rf lockbox lockbox-attest .lockbox-work .lockbox-sign
+
+      - name: Log in to the registry
+        env:
+          LOCKBOX_REGISTRY_USER: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          LOCKBOX_REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD || github.token }}
+        run: sh "$LOCKBOX_SCRIPTS/login.sh"
+
+      - name: Resolve and pin the base images
+        run: sh "$LOCKBOX_SCRIPTS/run-in.sh" "$LOCKBOX_CRANE_IMAGE" "$LOCKBOX_SCRIPTS/resolve.sh"
+
+      - name: Log in for base image pulls
+        env:
+          LOCKBOX_LOGIN_SCOPE: bases
+          LOCKBOX_PULL_USER: ${{ secrets.PULL_USERNAME }}
+          LOCKBOX_PULL_PASSWORD: ${{ secrets.PULL_PASSWORD }}
+        run: sh "$LOCKBOX_SCRIPTS/login.sh"
+
+      - name: Build and push to the staging tag
+        run: sh "$LOCKBOX_SCRIPTS/build.sh"
+
+      - name: Resolve the bound digest
+        id: bound
+        run: |
+          sh "$LOCKBOX_SCRIPTS/run-in.sh" "$LOCKBOX_CRANE_IMAGE" "$LOCKBOX_SCRIPTS/digest.sh"
+          echo "digest=$(cat .lockbox-work/digest)" >>"$GITHUB_OUTPUT"
+          # Multi-platform (v2.4.0): the platform manifests of the index, for the per-platform provenance steps.
+          if [ -s .lockbox-work/platform-digests ]; then
+            n=0
+            while read -r slug _ pd; do
+              n=$((n + 1))
+              echo "s$n=$slug" >>"$GITHUB_OUTPUT"
+              echo "p$n=$pd" >>"$GITHUB_OUTPUT"
+            done <.lockbox-work/platform-digests
+          fi
+
+      - name: Scan the digest with Trivy
+        run: sh "$LOCKBOX_SCRIPTS/run-in.sh" "$LOCKBOX_TRIVY_IMAGE" "$LOCKBOX_SCRIPTS/scan.sh"
+
+      - name: Write result.json
+        run: sh "$LOCKBOX_SCRIPTS/result.sh"
+
+      - name: Install cosign
+        if: inputs.signing != 'none' && env.LOCKBOX_PUBLISH == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Attest the scan result (A1)
+        if: inputs.signing != 'none' && env.LOCKBOX_PUBLISH == 'true'
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        # The bundle is written to lockbox-attest/ (T2.11c) and copied into lockbox/ so the
+        # lockbox-scan artifact keeps its layout. One job, one uid: nothing is made world-writable.
+        run: |
+          sh "$LOCKBOX_SCRIPTS/vuln.sh"
+          sh "$LOCKBOX_SCRIPTS/attest.sh"
+          rm -f lockbox/vuln.sigstore.json
+          if [ -f lockbox-attest/vuln.sigstore.json ]; then
+            cp lockbox-attest/vuln.sigstore.json lockbox/vuln.sigstore.json
+          fi
+          # Multi-platform (v2.4.0): one bundle per platform, next to that platform's result.json.
+          for b in lockbox-attest/*/vuln.sigstore.json; do
+            [ -f "$b" ] || continue
+            slug=$(basename "$(dirname "$b")")
+            cp "$b" "lockbox/$slug/vuln.sigstore.json"
+          done
+
+      - name: Upload results for Lockbox
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lockbox-scan
+          path: lockbox/
+          if-no-files-found: warn
+
+      - name: Fail when the scan did not pass
+        run: sh "$LOCKBOX_SCRIPTS/gate.sh"
+
+      - name: Promote the scanned digest to the release tag
+        if: env.LOCKBOX_PUBLISH == 'true'
+        run: sh "$LOCKBOX_SCRIPTS/run-in.sh" "$LOCKBOX_CRANE_IMAGE" "$LOCKBOX_SCRIPTS/promote.sh"
+
+      - name: Build the SLSA provenance predicate
+        if: inputs.signing != 'none' && env.LOCKBOX_PUBLISH == 'true'
+        run: sh "$LOCKBOX_SCRIPTS/provenance.sh"
+
+      - name: Attest provenance (keyless)
+        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.bound.outputs.digest }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: .lockbox-sign/provenance.json
+          push-to-registry: true
+
+      - name: Attest provenance of platform 1 (keyless, multi-platform)
+        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p1 != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.bound.outputs.p1 }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s1 }}/provenance.json
+          push-to-registry: true
+
+      - name: Attest provenance of platform 2 (keyless, multi-platform)
+        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p2 != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.bound.outputs.p2 }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s2 }}/provenance.json
+          push-to-registry: true
+
+      - name: Attest provenance of platform 3 (keyless, multi-platform)
+        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p3 != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.bound.outputs.p3 }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s3 }}/provenance.json
+          push-to-registry: true
+
+      - name: Attest provenance of platform 4 (keyless, multi-platform)
+        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p4 != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ inputs.image }}
+          subject-digest: ${{ steps.bound.outputs.p4 }}
+          predicate-type: https://slsa.dev/provenance/v1
+          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s4 }}/provenance.json
+          push-to-registry: true
+
+      - name: Sign the release digest
+        if: env.LOCKBOX_PUBLISH == 'true'
+        env:
+          # keyless: actions/attest above already attested; key: cosign attests here.
+          LOCKBOX_ATTEST: ${{ inputs.signing == 'keyless' && 'none' || 'cosign' }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: sh "$LOCKBOX_SCRIPTS/sign.sh"
+
+      - name: Remove registry credentials
+        if: always()
+        run: rm -rf "$DOCKER_CONFIG"

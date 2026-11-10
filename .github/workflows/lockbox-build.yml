@@ -40,7 +40,7 @@
 #         contents: read
 #         packages: write
 #         id-token: write
-#         attestations: write
+#         attestations: write                           # unused since v3.0.2 (kept for compatibility)
 #       uses: <org>/<repo>/.github/workflows/lockbox-build.yml@<full commit sha>   # by SHA, never a tag or branch
 #       with:
 #         image: ghcr.io/acme/payments-api              # release repository workloads pull
@@ -196,6 +196,8 @@ permissions: {}
 jobs:
   build-scan-promote:
     runs-on: ubuntu-24.04
+    # attestations: write is no longer used by this template (provenance is attested with cosign
+    # since v3.0.2); kept so callers and the pin check keep working (follow-up to drop).
     permissions:
       contents: read
       packages: write
@@ -318,7 +320,7 @@ jobs:
           #   LOCKBOX_ATTEST_DIR  vuln.sh, attest.sh: vuln-predicate.json,
           #                       vuln-statement.json, vuln.sigstore.json (the
           #                       lockbox:attest artifact; sign.sh reads the predicate)
-          #   LOCKBOX_SIGN_DIR    provenance.sh: provenance.json (sign.sh, actions/attest)
+          #   LOCKBOX_SIGN_DIR    provenance.sh: provenance.json (read by sign.sh)
           LOCKBOX_ATTEST_DIR=lockbox-attest
           LOCKBOX_SIGN_DIR=.lockbox-sign
 
@@ -1731,8 +1733,8 @@ jobs:
           #   LOCKBOX_SIGNING=key      LOCKBOX_COSIGN_KEY (KMS URI, env://VAR, key file);
           #                            LOCKBOX_TLOG_UPLOAD=false for offline use
           #   LOCKBOX_SIGNING=none     nothing is signed (Lockbox reports the image unverified)
-          #   LOCKBOX_ATTEST=cosign    (default) attest provenance here; "none" when the
-          #                            platform attests (GitHub keyless uses actions/attest)
+          #   LOCKBOX_ATTEST=cosign    (default) attest provenance here in every signing mode;
+          #                            "none" skips it (test hook only, no template sets it)
           # After the signature and the provenance, the signed vulnerability statement
           # (vuln.sh) is attached to the release digest as well (A2).
           # The password for an encrypted key comes from COSIGN_PASSWORD in the
@@ -1897,61 +1899,9 @@ jobs:
         if: inputs.signing != 'none' && env.LOCKBOX_PUBLISH == 'true'
         run: sh "$LOCKBOX_SCRIPTS/provenance.sh"
 
-      - name: Attest provenance (keyless)
-        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true'
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ inputs.image }}
-          subject-digest: ${{ steps.bound.outputs.digest }}
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: .lockbox-sign/provenance.json
-          push-to-registry: true
-
-      - name: Attest provenance of platform 1 (keyless, multi-platform)
-        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p1 != ''
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ inputs.image }}
-          subject-digest: ${{ steps.bound.outputs.p1 }}
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s1 }}/provenance.json
-          push-to-registry: true
-
-      - name: Attest provenance of platform 2 (keyless, multi-platform)
-        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p2 != ''
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ inputs.image }}
-          subject-digest: ${{ steps.bound.outputs.p2 }}
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s2 }}/provenance.json
-          push-to-registry: true
-
-      - name: Attest provenance of platform 3 (keyless, multi-platform)
-        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p3 != ''
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ inputs.image }}
-          subject-digest: ${{ steps.bound.outputs.p3 }}
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s3 }}/provenance.json
-          push-to-registry: true
-
-      - name: Attest provenance of platform 4 (keyless, multi-platform)
-        if: inputs.signing == 'keyless' && env.LOCKBOX_PUBLISH == 'true' && steps.bound.outputs.p4 != ''
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ inputs.image }}
-          subject-digest: ${{ steps.bound.outputs.p4 }}
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate-path: .lockbox-sign/${{ steps.bound.outputs.s4 }}/provenance.json
-          push-to-registry: true
-
       - name: Sign the release digest
         if: env.LOCKBOX_PUBLISH == 'true'
         env:
-          # keyless: actions/attest above already attested; key: cosign attests here.
-          LOCKBOX_ATTEST: ${{ inputs.signing == 'keyless' && 'none' || 'cosign' }}
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: sh "$LOCKBOX_SCRIPTS/sign.sh"
